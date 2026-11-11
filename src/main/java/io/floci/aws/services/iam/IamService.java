@@ -4621,6 +4621,80 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
                 session.getOriginAccountId(), session.getRoleArn(), session.getEc2RoleId(), session.getEc2InstanceId()));
     }
 
+    /**
+     * Who an EKS token's access key stands for, as EKS access entries match callers.
+     *
+     * @param kind         {@link #ROOT} for the account root (a key that names no IAM user, such as a bare
+     *                     account id or {@code test}, or a root session), {@link #USER}, {@link #ROLE} for an
+     *                     assumed-role session, or {@link #OTHER} for a federated user or a delegated session,
+     *                     which access entries cannot name
+     * @param accountId    the account the caller acts in
+     * @param principalArn the IAM user's ARN, or the assumed role's ARN with its path; null for the root
+     * @param principalId  the user's or role's unique id, which an access entry stores with its principal
+     * @param sessionName  a role session's name; null for a user
+     */
+    public record EksCaller(String kind, String accountId, String principalArn, String principalId,
+                            String sessionName) {
+        public static final String ROOT = "root";
+        public static final String USER = "user";
+        public static final String ROLE = "role";
+        public static final String OTHER = "other";
+    }
+
+    /**
+     * The caller behind an EKS token's access key, whichever account holds the key. Only for the EKS token
+     * webhook, which has no account in scope and checks the cluster's account itself.
+     *
+     * @param keyAccountId the account a verified long-term key belongs to; a key Floci does not store
+     *                     (a bare account id, {@code test}) is that account's root
+     */
+    public Optional<EksCaller> findEksCaller(String accessKeyId, String keyAccountId) {
+        if (accessKeyId == null || accessKeyId.isBlank()) {
+            return Optional.empty();
+        }
+        if (!isTemporaryAccessKey(accessKeyId)) {
+            Optional<AccountAwareStorageBackend.AccountEntry<AccessKey>> key = activeAccessKeyInAnyAccount(accessKeyId);
+            if (key.isEmpty()) {
+                return keyAccountId == null ? Optional.empty()
+                        : Optional.of(new EksCaller(EksCaller.ROOT, keyAccountId, null, null, null));
+            }
+            String account = key.get().accountId();
+            return findUser(account, key.get().value().getUserName())
+                    .map(user -> new EksCaller(EksCaller.USER, account, user.getArn(), user.getUserId(), null));
+        }
+        Optional<SessionCredential> found = currentSession(accessKeyId);
+        if (found.isEmpty()) {
+            return Optional.empty();
+        }
+        SessionCredential session = found.get();
+        String roleArn = session.getRoleArn();
+        if (session.getDelegatedApproverArn() != null || isFederatedUserSession(session)) {
+            return Optional.of(new EksCaller(EksCaller.OTHER, session.getOriginAccountId(), null, null, null));
+        }
+        if (roleArn == null) {
+            // GetSessionToken credentials act as the identity that minted them.
+            if (issuedByRoot(session)) {
+                return Optional.of(new EksCaller(EksCaller.ROOT,
+                        AwsArnUtils.accountOrDefault(session.getIssuerArn(), session.getOriginAccountId()),
+                        null, null, null));
+            }
+            return issuingUser(session).map(user -> new EksCaller(EksCaller.USER,
+                    AwsArnUtils.parse(user.getArn()).accountId(), user.getArn(), user.getUserId(), null));
+        }
+        if (isAccountRootArn(roleArn)) {
+            return Optional.of(new EksCaller(EksCaller.ROOT, AwsArnUtils.parse(roleArn).accountId(), null, null, null));
+        }
+        if (!AwsArnUtils.isArnFor(roleArn, "iam") || !roleArn.contains("/")) {
+            return Optional.empty();
+        }
+        String account = AwsArnUtils.parse(roleArn).accountId();
+        String sessionName = session.getRoleSessionName() != null ? session.getRoleSessionName()
+                : session.getEc2InstanceId() != null ? session.getEc2InstanceId() : "floci-session";
+        return findRole(account, roleArn.substring(roleArn.lastIndexOf('/') + 1))
+                .filter(role -> roleArn.equals(role.getArn()))
+                .map(role -> new EksCaller(EksCaller.ROLE, account, role.getArn(), role.getRoleId(), sessionName));
+    }
+
     private Optional<SessionCredential> currentSession(String accessKeyId) {
         return findSessionAnyAccount(accessKeyId).filter(session -> !isExpired(session, clock.instant()));
     }

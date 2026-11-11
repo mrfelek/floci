@@ -420,7 +420,7 @@ public class IamActionRegistry {
                 "eks:DeleteCertificateAuthority"),
         rule("eks", "POST",   "^/clusters/[^/]+/certificate-authorities/[^/]+/activate$",
                 "eks:ActivateCertificateAuthority"),
-        rule("eks", "GET",    "^/access-policies$",                                      "eks:ListAccessPolicies"),
+        rule("eks", "GET",    "^/_eks/access-policies$",                                 "eks:ListAccessPolicies"),
         rule("eks", "GET",    "^/cluster-versions$",                                     "eks:DescribeClusterVersions"),
         rule("eks", "POST",   "^/cluster-registrations$",                                "eks:RegisterCluster"),
         rule("eks", "DELETE", "^/cluster-registrations/[^/]+$",                          "eks:DeregisterCluster"),

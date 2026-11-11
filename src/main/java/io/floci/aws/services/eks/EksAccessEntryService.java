@@ -16,6 +16,7 @@ import io.floci.aws.services.eks.model.AssociatedAccessPolicy;
 import io.floci.aws.services.eks.model.Cluster;
 import io.floci.aws.services.eks.model.ClusterStatus;
 import io.floci.aws.services.eks.model.CreateAccessEntryRequest;
+import io.floci.aws.services.eks.model.UpdateAccessEntryRequest;
 import io.floci.aws.services.iam.IamService;
 import io.floci.aws.services.iam.model.IamRole;
 import io.floci.aws.services.iam.model.IamUser;
@@ -34,16 +35,21 @@ import java.util.Optional;
 import java.util.UUID;
 import java.util.function.UnaryOperator;
 
-/** Access-entry and access-policy management metadata; Kubernetes authorization is handled separately. */
+/**
+ * Access entries and their associated access policies. The token and authorization webhooks read them to
+ * authenticate and authorize Kubernetes requests when IAM enforcement is on.
+ */
 @ApplicationScoped
 public class EksAccessEntryService {
     private final StorageBackend<String, StoredEntry> entries;
     private final IamService iam;
     private final Clock clock;
+    private final EksAccessPolicyCatalog catalog;
 
     @Inject
-    public EksAccessEntryService(StorageFactory factory, IamService iam) {
-        this(factory.create("eks", "eks-access-entries.json", new TypeReference<Map<String, StoredEntry>>() {}), iam);
+    public EksAccessEntryService(StorageFactory factory, IamService iam, EksAccessPolicyCatalog catalog) {
+        this(factory.create("eks", "eks-access-entries.json", new TypeReference<Map<String, StoredEntry>>() {}), iam,
+                Clock.systemUTC(), catalog);
     }
 
     EksAccessEntryService(StorageBackend<String, StoredEntry> entries, IamService iam) {
@@ -51,9 +57,15 @@ public class EksAccessEntryService {
     }
 
     EksAccessEntryService(StorageBackend<String, StoredEntry> entries, IamService iam, Clock clock) {
+        this(entries, iam, clock, new EksAccessPolicyCatalog());
+    }
+
+    EksAccessEntryService(StorageBackend<String, StoredEntry> entries, IamService iam, Clock clock,
+                          EksAccessPolicyCatalog catalog) {
         this.entries = entries;
         this.iam = iam;
         this.clock = clock;
+        this.catalog = catalog;
     }
 
     @RegisterForReflection
@@ -77,6 +89,9 @@ public class EksAccessEntryService {
             throw invalid("policyArn is required");
         }
         requireAccessPolicyArn(cluster, request.policyArn());
+        if (catalog.forArn(request.policyArn()).isEmpty()) {
+            throw invalid("policyArn must identify an EKS cluster access policy");
+        }
         AccessScope scope = accessScope(request.accessScope());
         if (!"STANDARD".equals(stored.entry().type())) {
             throw new AwsException("InvalidRequestException",
@@ -176,17 +191,8 @@ public class EksAccessEntryService {
                 : iam.findUser(arn.accountId(), name).filter(value -> principal.equals(value.getArn()))
                         .map(IamUser::getUserId).orElseThrow(() -> invalid("IAM user does not exist"));
         String username = node ? "system:node:{{EC2PrivateDNSName}}" : request.username();
-        if (username != null && !node && (username.isBlank()
-                || username.matches("^(system|eks|aws|amazon|iam):.*"))) {
-            throw invalid("Invalid username");
-        }
         if (username != null && !node) {
-            for (String placeholder : List.of("{{SessionName}}", "{{SessionNameRaw}}")) {
-                int position = username.indexOf(placeholder);
-                if (position >= 0 && !username.substring(0, position).contains(":")) {
-                    throw invalid("A session-name placeholder must be preceded by a colon");
-                }
-            }
+            requireValidUsername(username);
         }
         if (username == null) {
             username = role ? AwsArnUtils.Arn.global(arn.partition(), "sts", arn.accountId(),
@@ -194,9 +200,7 @@ public class EksAccessEntryService {
         }
         List<String> groups = node ? List.of("system:nodes")
                 : request.kubernetesGroups() == null ? List.of() : request.kubernetesGroups();
-        if (groups.stream().anyMatch(group -> group == null || group.isBlank())) {
-            throw invalid("kubernetesGroups must contain nonempty strings");
-        }
+        requireValidGroups(groups);
         Map<String, String> tags = request.tags() == null ? Map.of() : request.tags();
         if (tags.size() > 50 || tags.entrySet().stream().anyMatch(tag -> tag.getKey() == null
                 || tag.getKey().isEmpty() || tag.getKey().length() > 128 || tag.getValue() == null
@@ -239,6 +243,99 @@ public class EksAccessEntryService {
                 ? aware.getForAccount(accountId, key) : entries.get(key);
         return stored.filter(value -> roleId != null && roleId.equals(value.principalId()))
                 .map(StoredEntry::entry).filter(entry -> "EC2_LINUX".equals(entry.type()));
+    }
+
+    /**
+     * The STANDARD entry {@code cluster} holds for {@code principalArn}, read from the cluster's account
+     * {@code accountId}, when it was created for the principal whose unique id is {@code principalId}. As on EKS
+     * an entry stays bound to the principal it was created for: a user or role deleted and created again
+     * under the same ARN has a new id, and the old entry no longer applies to it.
+     */
+    synchronized Optional<StoredEntry> standardEntry(Cluster cluster, String accountId, String principalArn,
+                                                     String principalId) {
+        if (principalArn == null || principalId == null) {
+            return Optional.empty();
+        }
+        String key = prefix(cluster) + principalArn;
+        Optional<StoredEntry> stored = entries instanceof AccountAwareStorageBackend<StoredEntry> aware
+                ? aware.getForAccount(accountId, key) : entries.get(key);
+        return stored.filter(value -> principalId.equals(value.principalId()))
+                .filter(value -> "STANDARD".equals(value.entry().type()));
+    }
+
+    /**
+     * The access entry EKS creates for the cluster's creator when {@code bootstrapClusterCreatorAdminPermissions}
+     * is set: STANDARD, with the generated username, and {@code AmazonEKSClusterAdminPolicy} at cluster scope.
+     * It is an ordinary entry, so it can be listed, changed and deleted.
+     */
+    synchronized void bootstrapCreator(Cluster cluster) {
+        String principal = cluster.getCreatorPrincipalArn();
+        if (principal == null || cluster.getCreatorPrincipalId() == null) {
+            return;
+        }
+        AwsArnUtils.Arn arn = AwsArnUtils.parse(principal);
+        AwsArnUtils.Arn clusterArn = AwsArnUtils.parse(cluster.getArn());
+        String name = principal.substring(principal.lastIndexOf('/') + 1);
+        boolean role = arn.resource().startsWith("role/");
+        String username = role ? AwsArnUtils.Arn.global(arn.partition(), "sts", arn.accountId(),
+                "assumed-role/" + name + "/{{SessionName}}").toString() : principal;
+        double now = EpochSeconds.fromMillis(clock.millis());
+        String entryArn = new AwsArnUtils.Arn(clusterArn.partition(), "eks", clusterArn.region(), clusterArn.accountId(),
+                "access-entry/" + cluster.getName() + "/" + (role ? "role" : "user") + "/" + arn.accountId() + "/" + name
+                        + "/" + UUID.randomUUID()).toString();
+        AccessEntry entry = new AccessEntry(entryArn, cluster.getName(), principal, "STANDARD", username, List.of(),
+                Map.of(), now, now);
+        AssociatedAccessPolicy admin = new AssociatedAccessPolicy(
+                EksAccessPolicyCatalog.arn(clusterArn.partition(), "AmazonEKSClusterAdminPolicy"),
+                new AccessScope("cluster", List.of()), now, now);
+        entries.put(prefix(cluster) + principal, new StoredEntry(entry, cluster.getCreatorPrincipalId(), null,
+                List.of(admin)));
+    }
+
+    /**
+     * UpdateAccessEntry: replaces a STANDARD entry's username and Kubernetes groups, each only when the request
+     * gives it. Other entry types take neither, as their username and groups are EKS's own.
+     */
+    public synchronized AccessEntry update(Cluster cluster, String principal, UpdateAccessEntryRequest request) {
+        StoredEntry stored = storedEntry(cluster, principal);
+        AccessEntry current = stored.entry();
+        String username = request == null ? null : request.username();
+        List<String> groups = request == null ? null : request.kubernetesGroups();
+        if (!"STANDARD".equals(current.type()) && (username != null || groups != null)) {
+            throw invalid("Only STANDARD access entries take a username or kubernetesGroups");
+        }
+        if (username != null) {
+            requireValidUsername(username);
+        }
+        if (groups != null) {
+            requireValidGroups(groups);
+        }
+        AccessEntry updated = new AccessEntry(current.accessEntryArn(), current.clusterName(), current.principalArn(),
+                current.type(), username == null ? current.username() : username,
+                groups == null ? current.kubernetesGroups() : List.copyOf(groups), current.tags(), current.createdAt(),
+                EpochSeconds.fromMillis(clock.millis()));
+        entries.put(prefix(cluster) + principal, new StoredEntry(updated, stored.principalId(),
+                stored.clientRequestToken(), stored.accessPolicies()));
+        return updated;
+    }
+
+    /** The rules EKS gives a custom username: no reserved prefix, and a colon before a session-name placeholder. */
+    private static void requireValidUsername(String username) {
+        if (username.isBlank() || username.matches("^(system|eks|aws|amazon|iam):.*")) {
+            throw invalid("Invalid username");
+        }
+        for (String placeholder : List.of("{{SessionName}}", "{{SessionNameRaw}}")) {
+            int position = username.indexOf(placeholder);
+            if (position >= 0 && !username.substring(0, position).contains(":")) {
+                throw invalid("A session-name placeholder must be preceded by a colon");
+            }
+        }
+    }
+
+    private static void requireValidGroups(List<String> groups) {
+        if (groups.stream().anyMatch(group -> group == null || group.isBlank())) {
+            throw invalid("kubernetesGroups must contain nonempty strings");
+        }
     }
 
     public synchronized AccessEntry describe(Cluster cluster, String principal) {

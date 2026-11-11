@@ -110,6 +110,18 @@ public class Cluster {
     @JsonProperty("nodeInstanceType")
     @JsonInclude(JsonInclude.Include.NON_NULL)
     private String nodeInstanceType;
+    /**
+     * The IAM user or role that created the cluster, and its unique id. EKS gives the creator an access entry
+     * with cluster admin when {@code bootstrapClusterCreatorAdminPermissions} is set, and in {@code CONFIG_MAP}
+     * mode maps it to {@code system:masters} without any visible configuration. Internal persisted metadata,
+     * omitted from AWS API responses by toClusterResponse in EksController.
+     */
+    @JsonProperty("creatorPrincipalArn")
+    @JsonInclude(JsonInclude.Include.NON_NULL)
+    private String creatorPrincipalArn;
+    @JsonProperty("creatorPrincipalId")
+    @JsonInclude(JsonInclude.Include.NON_NULL)
+    private String creatorPrincipalId;
 
     /**
      * Caller-supplied k3s arguments passed at creation via reserved floci tags.
@@ -203,6 +215,12 @@ public class Cluster {
     public String getNodeInstanceType() { return nodeInstanceType; }
     public void setNodeInstanceType(String nodeInstanceType) { this.nodeInstanceType = nodeInstanceType; }
 
+    public String getCreatorPrincipalArn() { return creatorPrincipalArn; }
+    public void setCreatorPrincipalArn(String creatorPrincipalArn) { this.creatorPrincipalArn = creatorPrincipalArn; }
+
+    public String getCreatorPrincipalId() { return creatorPrincipalId; }
+    public void setCreatorPrincipalId(String creatorPrincipalId) { this.creatorPrincipalId = creatorPrincipalId; }
+
     public List<String> getClusterArgs() { return clusterArgs; }
     public void setClusterArgs(List<String> clusterArgs) { this.clusterArgs = clusterArgs; }
 
@@ -265,6 +283,8 @@ public class Cluster {
         c.clusterArgs = this.clusterArgs != null ? new ArrayList<>(this.clusterArgs) : null;
         c.defaultStorageClass = this.defaultStorageClass;
         c.joinedInstanceIds = this.joinedInstanceIds != null ? new ConcurrentHashMap<>(this.joinedInstanceIds) : null;
+        c.creatorPrincipalArn = this.creatorPrincipalArn;
+        c.creatorPrincipalId = this.creatorPrincipalId;
         c.accessConfig = this.accessConfig;
         return c;
     }

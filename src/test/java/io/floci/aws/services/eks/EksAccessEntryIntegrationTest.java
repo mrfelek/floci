@@ -228,6 +228,151 @@ class EksAccessEntryIntegrationTest {
                 .formParam("Action", "DeleteRole").formParam("RoleName", role).post("/").then().statusCode(200);
     }
 
+    @Test
+    void updateAccessEntryReplacesUsernameAndGroupsOfAStandardEntryOnly() {
+        String account = "135791357913";
+        String name = "update-" + UUID.randomUUID().toString().substring(0, 8);
+        String role = "dev-" + name;
+        String principal = "arn:aws:iam::" + account + ":role/" + role;
+        String entryPath = "/clusters/" + name + "/access-entries/" + URLEncoder.encode(principal, StandardCharsets.UTF_8);
+        given().header("Authorization", auth(account, "iam")).contentType("application/x-www-form-urlencoded")
+                .formParam("Action", "CreateRole").formParam("RoleName", role)
+                .formParam("AssumeRolePolicyDocument", "{}").post("/").then().statusCode(200);
+        createCluster(account, name, "API");
+        try {
+            double createdAt = given().header("Authorization", auth(account, "eks")).contentType("application/json")
+                    .body(Map.of("principalArn", principal, "kubernetesGroups", List.of("viewers")))
+                    .post("/clusters/" + name + "/access-entries").then().statusCode(200)
+                    .extract().jsonPath().getDouble("accessEntry.createdAt");
+            given().header("Authorization", auth(account, "eks")).contentType("application/json")
+                    .urlEncodingEnabled(false).body(Map.of("kubernetesGroups", List.of("developers", "oncall")))
+                    .post(entryPath).then().statusCode(200)
+                    .body("accessEntry.kubernetesGroups", contains("developers", "oncall"))
+                    .body("accessEntry.username", equalTo("arn:aws:sts::" + account + ":assumed-role/" + role
+                            + "/{{SessionName}}"))
+                    .body("accessEntry.createdAt", equalTo((float) createdAt));
+            given().header("Authorization", auth(account, "eks")).contentType("application/json")
+                    .urlEncodingEnabled(false).body(Map.of("username", "dev:{{SessionName}}"))
+                    .post(entryPath).then().statusCode(200)
+                    .body("accessEntry.username", equalTo("dev:{{SessionName}}"))
+                    .body("accessEntry.kubernetesGroups", contains("developers", "oncall"));
+            given().header("Authorization", auth(account, "eks")).contentType("application/json")
+                    .urlEncodingEnabled(false).body(Map.of("username", "system:admin"))
+                    .post(entryPath).then().statusCode(400).body("__type", equalTo("InvalidParameterException"));
+        } finally {
+            given().header("Authorization", auth(account, "eks")).delete("/clusters/" + name).then().statusCode(200);
+            given().header("Authorization", auth(account, "iam")).contentType("application/x-www-form-urlencoded")
+                    .formParam("Action", "DeleteRole").formParam("RoleName", role).post("/").then().statusCode(200);
+        }
+    }
+
+    @Test
+    void listAccessPoliciesPagesThroughEveryPolicyAndLeavesS3ItsBucket() {
+        String account = "135791357913";
+        given().header("Authorization", auth(account, "eks")).get("/access-policies").then().statusCode(200)
+                .body("accessPolicies", hasSize(28))
+                .body("accessPolicies.name", hasItems("AmazonEKSClusterAdminPolicy", "AmazonEKSViewPolicy"))
+                .body("accessPolicies.find { it.name == 'AmazonEKSAdminPolicy' }.arn",
+                        equalTo("arn:aws:eks::aws:cluster-access-policy/AmazonEKSAdminPolicy"))
+                .body("nextToken", nullValue());
+        String token = given().header("Authorization", auth(account, "eks")).queryParam("maxResults", 20)
+                .get("/access-policies").then().statusCode(200).body("accessPolicies", hasSize(20))
+                .extract().path("nextToken");
+        given().header("Authorization", auth(account, "eks")).queryParam("nextToken", token)
+                .get("/access-policies").then().statusCode(200).body("accessPolicies", hasSize(8))
+                .body("nextToken", nullValue());
+        // Signed for S3, the path is a bucket.
+        given().header("Authorization", auth(account, "s3")).get("/access-policies").then()
+                .statusCode(404).body(containsString("NoSuchBucket"));
+    }
+
+    @Test
+    void associateAccessPolicyRefusesAPolicyAwsDoesNotDefine() {
+        String account = "135791357913";
+        String name = "unknown-" + UUID.randomUUID().toString().substring(0, 8);
+        String role = "dev-" + name;
+        String principal = "arn:aws:iam::" + account + ":role/" + role;
+        given().header("Authorization", auth(account, "iam")).contentType("application/x-www-form-urlencoded")
+                .formParam("Action", "CreateRole").formParam("RoleName", role)
+                .formParam("AssumeRolePolicyDocument", "{}").post("/").then().statusCode(200);
+        createCluster(account, name, "API");
+        try {
+            given().header("Authorization", auth(account, "eks")).contentType("application/json")
+                    .body(Map.of("principalArn", principal)).post("/clusters/" + name + "/access-entries")
+                    .then().statusCode(200);
+            given().header("Authorization", auth(account, "eks")).contentType("application/json")
+                    .urlEncodingEnabled(false)
+                    .body(Map.of("policyArn", "arn:aws:eks::aws:cluster-access-policy/AmazonEKSMadeUpPolicy",
+                            "accessScope", Map.of("type", "cluster")))
+                    .post("/clusters/" + name + "/access-entries/" + URLEncoder.encode(principal, StandardCharsets.UTF_8)
+                            + "/access-policies")
+                    .then().statusCode(400).body("__type", equalTo("InvalidParameterException"));
+        } finally {
+            given().header("Authorization", auth(account, "eks")).delete("/clusters/" + name).then().statusCode(200);
+            given().header("Authorization", auth(account, "iam")).contentType("application/x-www-form-urlencoded")
+                    .formParam("Action", "DeleteRole").formParam("RoleName", role).post("/").then().statusCode(200);
+        }
+    }
+
+    @Test
+    void creatorGetsAClusterAdminEntryWhenBootstrapPermissionsAreOn() {
+        String account = "135791357913";
+        String name = "creator-" + UUID.randomUUID().toString().substring(0, 8);
+        String user = "deployer-" + name;
+        given().header("Authorization", auth(account, "iam")).contentType("application/x-www-form-urlencoded")
+                .formParam("Action", "CreateUser").formParam("UserName", user).post("/").then().statusCode(200);
+        String key = given().header("Authorization", auth(account, "iam"))
+                .contentType("application/x-www-form-urlencoded").formParam("Action", "CreateAccessKey")
+                .formParam("UserName", user).post("/").then().statusCode(200)
+                .extract().xmlPath().getString("CreateAccessKeyResponse.CreateAccessKeyResult.AccessKey.AccessKeyId");
+        String principal = "arn:aws:iam::" + account + ":user/" + user;
+        String entryPath = "/clusters/" + name + "/access-entries/" + URLEncoder.encode(principal, StandardCharsets.UTF_8);
+        try {
+            given().header("Authorization", auth(key, "eks")).contentType("application/json")
+                    .body(Map.of("name", name, "roleArn", "arn:aws:iam::" + account + ":role/cluster",
+                            "accessConfig", Map.of("authenticationMode", "API")))
+                    .post("/clusters").then().statusCode(200)
+                    .body("cluster.accessConfig.bootstrapClusterCreatorAdminPermissions", equalTo(true))
+                    .body("cluster", not(hasKey("creatorPrincipalArn")));
+            given().header("Authorization", auth(account, "eks")).get("/clusters/" + name + "/access-entries")
+                    .then().statusCode(200).body("accessEntries", contains(principal));
+            given().header("Authorization", auth(account, "eks")).urlEncodingEnabled(false).get(entryPath)
+                    .then().statusCode(200).body("accessEntry.type", equalTo("STANDARD"))
+                    .body("accessEntry.username", equalTo(principal));
+            given().header("Authorization", auth(account, "eks")).urlEncodingEnabled(false)
+                    .get(entryPath + "/access-policies").then().statusCode(200)
+                    .body("associatedAccessPolicies.policyArn",
+                            contains("arn:aws:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy"))
+                    .body("associatedAccessPolicies[0].accessScope.type", equalTo("cluster"));
+            given().header("Authorization", auth(account, "eks")).get("/clusters/" + name).then().statusCode(200)
+                    .body("cluster", not(hasKey("creatorPrincipalArn")))
+                    .body("cluster", not(hasKey("creatorPrincipalId")));
+        } finally {
+            given().header("Authorization", auth(account, "eks")).delete("/clusters/" + name).then().statusCode(200);
+            given().header("Authorization", auth(account, "iam")).contentType("application/x-www-form-urlencoded")
+                    .formParam("Action", "DeleteAccessKey").formParam("UserName", user)
+                    .formParam("AccessKeyId", key).post("/").then().statusCode(200);
+            given().header("Authorization", auth(account, "iam")).contentType("application/x-www-form-urlencoded")
+                    .formParam("Action", "DeleteUser").formParam("UserName", user).post("/").then().statusCode(200);
+        }
+    }
+
+    @Test
+    void accountRootCreatesNoEntryAndConfigMapModeNone() {
+        String account = "135791357913";
+        String name = "root-" + UUID.randomUUID().toString().substring(0, 8);
+        try {
+            given().header("Authorization", auth(account, "eks")).contentType("application/json")
+                    .body(Map.of("name", name, "roleArn", "arn:aws:iam::" + account + ":role/cluster",
+                            "accessConfig", Map.of("authenticationMode", "API")))
+                    .post("/clusters").then().statusCode(200);
+            given().header("Authorization", auth(account, "eks")).get("/clusters/" + name + "/access-entries")
+                    .then().statusCode(200).body("accessEntries", empty());
+        } finally {
+            given().header("Authorization", auth(account, "eks")).delete("/clusters/" + name).then().statusCode(200);
+        }
+    }
+
     private static void createCluster(String account, String name, String mode) {
         given().header("Authorization", auth(account, "eks")).contentType("application/json")
                 .body(Map.of("name", name, "roleArn", "arn:aws:iam::" + account + ":role/cluster",

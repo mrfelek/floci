@@ -48,6 +48,7 @@ import io.floci.aws.services.eks.model.NodegroupStatus;
 import io.floci.aws.services.eks.model.OidcIdentity;
 import io.floci.aws.services.eks.model.Provider;
 import io.floci.aws.services.eks.model.ResourcesVpcConfig;
+import io.floci.aws.services.iam.IamService;
 import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
 import jakarta.enterprise.context.ApplicationScoped;
@@ -601,6 +602,16 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
     }
 
     public Cluster createCluster(CreateClusterRequest request) {
+        return createCluster(request, null);
+    }
+
+    /**
+     * Creates a cluster for {@code creator}, the IAM user or role that called CreateCluster, or null when no
+     * access entry could name the caller. In {@code API} and {@code API_AND_CONFIG_MAP} mode with
+     * {@code bootstrapClusterCreatorAdminPermissions} the creator gets a STANDARD access entry with
+     * {@code AmazonEKSClusterAdminPolicy} at cluster scope, as on EKS.
+     */
+    public Cluster createCluster(CreateClusterRequest request, IamService.EksCaller creator) {
         String name = request.getName();
         if (name == null || name.isBlank()) {
             throw new AwsException("InvalidParameterException", "Cluster name is required", 400);
@@ -640,6 +651,10 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
         cluster.setArn(arn);
         cluster.setAccountId(accountId);
         cluster.setCreatedAt(Instant.now());
+        if (creator != null) {
+            cluster.setCreatorPrincipalArn(creator.principalArn());
+            cluster.setCreatorPrincipalId(creator.principalId());
+        }
 
         if (request.getVersion() != null && !request.getVersion().isBlank()) {
             String requestedVersion = request.getVersion().trim();
@@ -720,6 +735,10 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
             }
 
             storage.put(name, cluster);
+            if (creator != null && Boolean.TRUE.equals(accessConfig.bootstrapClusterCreatorAdminPermissions())
+                    && !"CONFIG_MAP".equals(accessConfig.authenticationMode())) {
+                accessEntries.bootstrapCreator(cluster);
+            }
         } catch (RuntimeException e) {
             if (clusterSg != null) {
                 try {

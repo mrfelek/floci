@@ -116,12 +116,20 @@ public class EksClusterManager
     private static final String NODE_CAPACITY_LABEL = "io.floci.eks.node-capacity";
     private static final String DEFAULT_STORAGE_CLASS_LABEL = "io.floci.eks.default-storage-class";
     private static final String ENDPOINT_HOST_LABEL = "io.floci.eks.endpoint-host";
+    /**
+     * Marks a k3s container whose API server asks Floci's authorization webhook, which applies EKS access
+     * policies. A surviving container without it is recreated, data volume intact, so it gains the webhook.
+     */
+    private static final String AUTHORIZATION_WEBHOOK_LABEL = "io.floci.eks.authorization-webhook";
+    private static final String AUTHORIZATION_WEBHOOK_VERSION = "v1";
     private static final Pattern HOSTNAME = Pattern.compile(
             "[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*");
 
     private static final String WEBHOOK_CONFIG_DIR = "/etc";
     private static final String WEBHOOK_CONFIG_FILE = "token-webhook.yaml";
     private static final String WEBHOOK_CONFIG_PATH = WEBHOOK_CONFIG_DIR + "/" + WEBHOOK_CONFIG_FILE;
+    private static final String AUTHORIZATION_WEBHOOK_CONFIG_FILE = "authorization-webhook.yaml";
+    private static final String AUTHORIZATION_WEBHOOK_CONFIG_PATH = WEBHOOK_CONFIG_DIR + "/" + AUTHORIZATION_WEBHOOK_CONFIG_FILE;
     // Tar entry extracted at /etc; the archive path creates /etc/rancher/k3s, which does not
     // exist yet in a created-but-not-started k3s container.
     private static final String REGISTRIES_TAR_ENTRY = "rancher/k3s/registries.yaml";
@@ -680,6 +688,9 @@ public class EksClusterManager
                 "eks", cluster.getName(), labelAccountId, clusterRegion(cluster)));
         labels.put(NODE_CAPACITY_LABEL, capacityLabel(cluster, nodeLimits));
         labels.put(DEFAULT_STORAGE_CLASS_LABEL, String.valueOf(defaultStorageClass));
+        if (config.services().eks().iamAuthWebhook()) {
+            labels.put(AUTHORIZATION_WEBHOOK_LABEL, AUTHORIZATION_WEBHOOK_VERSION);
+        }
         if (!"localhost".equals(endpointHost)) {
             labels.put(ENDPOINT_HOST_LABEL, endpointHost);
         }
@@ -717,6 +728,7 @@ public class EksClusterManager
         // so it works the same natively and in Docker-in-Docker, with no host-path /
         // host-persistent-path requirement.
         String webhookLocalFile = null;
+        String authorizationWebhookLocalFile = null;
         if (config.services().eks().iamAuthWebhook()) {
             webhookLocalFile = writeWebhookKubeconfig(cluster);
             if (webhookLocalFile != null) {
@@ -725,6 +737,19 @@ public class EksClusterManager
                         + WEBHOOK_CONFIG_PATH);
                 serverArgs.add("--kube-apiserver-arg=authentication-token-webhook-version=v1");
                 serverArgs.add("--kube-apiserver-arg=authentication-token-webhook-cache-ttl=30s");
+            }
+            // EKS applies access policies in an authorizer of its own next to Kubernetes RBAC. RBAC comes
+            // first; the webhook only ever allows or has no opinion, so the two combine as a union, as on EKS.
+            // It answers no opinion while IAM enforcement is off, so wiring it changes nothing then.
+            authorizationWebhookLocalFile = writeAuthorizationWebhookKubeconfig(cluster);
+            if (authorizationWebhookLocalFile != null) {
+                serverArgs.add("--kube-apiserver-arg=authorization-mode=Node,RBAC,Webhook");
+                serverArgs.add("--kube-apiserver-arg=authorization-webhook-config-file="
+                        + AUTHORIZATION_WEBHOOK_CONFIG_PATH);
+                serverArgs.add("--kube-apiserver-arg=authorization-webhook-version=v1");
+                // Short caches, so an association or a disassociation takes effect within seconds.
+                serverArgs.add("--kube-apiserver-arg=authorization-webhook-cache-authorized-ttl=5s");
+                serverArgs.add("--kube-apiserver-arg=authorization-webhook-cache-unauthorized-ttl=5s");
             }
         }
 
@@ -781,6 +806,9 @@ public class EksClusterManager
         cluster.setContainerId(containerId);
         if (webhookLocalFile != null) {
             copyWebhookIntoContainer(containerId, webhookLocalFile, cluster.getName());
+        }
+        if (authorizationWebhookLocalFile != null) {
+            copyWebhookIntoContainer(containerId, authorizationWebhookLocalFile, cluster.getName());
         }
         if (auditPolicyLocalFile != null) {
             copyAuditPolicyIntoContainer(containerId, auditPolicyLocalFile, cluster.getName());
@@ -864,7 +892,10 @@ public class EksClusterManager
             startCluster(cluster);
             return;
         }
-        if (capacityChanged || onAnotherNetwork(existing.get())
+        boolean authorizationWebhookMissing = config.services().eks().iamAuthWebhook()
+                && (existingLabels == null
+                || !AUTHORIZATION_WEBHOOK_VERSION.equals(existingLabels.get(AUTHORIZATION_WEBHOOK_LABEL)));
+        if (capacityChanged || authorizationWebhookMissing || onAnotherNetwork(existing.get())
                 || !endpointHost.equals(certificateHost(existingLabels))) {
             replaceClusterContainer(cluster, null);
         }
@@ -1719,6 +1750,26 @@ public class EksClusterManager
     }
 
     /**
+     * Writes the authorization-webhook kubeconfig (basename {@value #AUTHORIZATION_WEBHOOK_CONFIG_FILE}) next to
+     * the token webhook's, or returns {@code null} when it cannot be written, leaving the cluster on RBAC alone.
+     */
+    private String writeAuthorizationWebhookKubeconfig(Cluster cluster) {
+        String clusterName = cluster.getName();
+        Path localFile = Paths.get(config.services().eks().dataPath(), "webhook", clusterName,
+                AUTHORIZATION_WEBHOOK_CONFIG_FILE).toAbsolutePath().normalize();
+        try {
+            Files.createDirectories(localFile.getParent());
+            Files.writeString(localFile, buildWebhookKubeconfig("http://" + dockerHostResolver.resolve() + ":"
+                    + config.port() + authorizationWebhookPath(cluster, clusterRegion(cluster))));
+        } catch (IOException e) {
+            LOG.warnv("EKS access policies disabled for cluster {0}: could not write the authorization webhook "
+                    + "kubeconfig: {1}", clusterName, e.getMessage());
+            return null;
+        }
+        return localFile.toString();
+    }
+
+    /**
      * Streams the webhook kubeconfig from Floci's filesystem into the (created, not-yet-started)
      * k3s container at {@value #WEBHOOK_CONFIG_PATH}, using the Docker API. Reading the file
      * client-side avoids any host bind-mount, so this works in native and Docker-in-Docker modes
@@ -2403,6 +2454,13 @@ public class EksClusterManager
 
     static String webhookPath(String clusterName) {
         return "/_floci/eks/clusters/" + clusterName + "/token-webhook";
+    }
+
+    /** The authorization webhook's path, scoped as the token webhook's is. */
+    static String authorizationWebhookPath(Cluster cluster, String defaultRegion) {
+        String tokenWebhook = webhookPath(cluster, defaultRegion);
+        return "/_floci/eks/clusters/" + cluster.getName() + "/authorization-webhook"
+                + tokenWebhook.substring(webhookPath(cluster.getName()).length());
     }
 
     /**

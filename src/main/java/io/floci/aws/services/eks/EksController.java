@@ -1,7 +1,10 @@
 package io.floci.aws.services.eks;
 
+import io.floci.aws.core.common.AwsException;
 import io.floci.aws.core.common.PaginatedResult;
 import io.floci.aws.core.common.Pagination;
+import io.floci.aws.core.common.RegionResolver;
+import io.floci.aws.core.common.RequestContext;
 import io.floci.aws.services.eks.model.Addon;
 import io.floci.aws.services.eks.model.AssociateAccessPolicyRequest;
 import io.floci.aws.services.eks.model.AssociatedAccessPolicy;
@@ -16,8 +19,10 @@ import io.floci.aws.services.eks.model.FargateProfile;
 import io.floci.aws.services.eks.model.Nodegroup;
 import io.floci.aws.services.eks.model.PodIdentityAssociation;
 import io.floci.aws.services.eks.model.Update;
+import io.floci.aws.services.eks.model.UpdateAccessEntryRequest;
 import io.floci.aws.services.eks.model.UpdateAddonRequest;
 import io.floci.aws.services.eks.model.UpdatePodIdentityAssociationRequest;
+import io.floci.aws.services.iam.IamService;
 import jakarta.inject.Inject;
 import jakarta.ws.rs.Consumes;
 import jakarta.ws.rs.DELETE;
@@ -59,21 +64,36 @@ public class EksController {
     private final EksAccessEntryService accessEntries;
     private final EksPodIdentityAssociationService podIdentityAssociations;
     private final EksAddonService addons;
+    private final EksAccessPolicyCatalog accessPolicies;
+    private final RegionResolver regionResolver;
+    private final IamService iam;
+    private final RequestContext requestContext;
 
     @Inject
     public EksController(EksService eksService, EksAccessEntryService accessEntries,
                          EksPodIdentityAssociationService podIdentityAssociations,
-                         EksAddonService addons) {
+                         EksAddonService addons, EksAccessPolicyCatalog accessPolicies, RegionResolver regionResolver,
+                         IamService iam, RequestContext requestContext) {
         this.eksService = eksService;
         this.accessEntries = accessEntries;
         this.podIdentityAssociations = podIdentityAssociations;
         this.addons = addons;
+        this.accessPolicies = accessPolicies;
+        this.regionResolver = regionResolver;
+        this.iam = iam;
+        this.requestContext = requestContext;
     }
 
     @POST
     @Path("/clusters")
     public Response createCluster(CreateClusterRequest request) {
-        Cluster cluster = eksService.createCluster(request);
+        // The creator is the IAM user or role the request is signed with; the account root and other callers
+        // that no access entry can name are not recorded.
+        IamService.EksCaller creator = iam.findEksCaller(requestContext.getAccessKeyId(), regionResolver.getAccountId())
+                .filter(caller -> IamService.EksCaller.USER.equals(caller.kind())
+                        || IamService.EksCaller.ROLE.equals(caller.kind()))
+                .orElse(null);
+        Cluster cluster = eksService.createCluster(request, creator);
         return Response.ok(Map.of("cluster", toClusterResponse(cluster))).build();
     }
 
@@ -110,7 +130,7 @@ public class EksController {
     private Cluster toClusterResponse(Cluster cluster) {
         if (cluster == null || (!cluster.isExplicitVersion() && cluster.getNodeInstanceType() == null
                 && cluster.getClusterArgs() == null && cluster.getDefaultStorageClass() == null
-                && cluster.getJoinedInstanceIds() == null)) {
+                && cluster.getJoinedInstanceIds() == null && cluster.getCreatorPrincipalArn() == null)) {
             return cluster;
         }
         Cluster response = cluster.copy();
@@ -119,6 +139,8 @@ public class EksController {
         response.setClusterArgs(null);
         response.setDefaultStorageClass(null);
         response.setJoinedInstanceIds(null);
+        response.setCreatorPrincipalArn(null);
+        response.setCreatorPrincipalId(null);
         return response;
     }
 
@@ -219,6 +241,31 @@ public class EksController {
     @Path("/clusters/{name}/access-entries/{principalArn: .+}")
     public Response describeAccessEntry(@PathParam("name") String name, @PathParam("principalArn") String principalArn) {
         return Response.ok(Map.of("accessEntry", accessEntries.describe(eksService.requireClusterInRequestRegion(name), principalArn))).build();
+    }
+
+    @POST
+    @Path("/clusters/{name}/access-entries/{principalArn: .+}")
+    public Response updateAccessEntry(@PathParam("name") String name, @PathParam("principalArn") String principalArn,
+                                      UpdateAccessEntryRequest request) {
+        return Response.ok(Map.of("accessEntry",
+                accessEntries.update(eksService.requireClusterInRequestRegion(name), principalArn, request))).build();
+    }
+
+    /** ListAccessPolicies: every access policy AWS defines, by name and ARN. */
+    @GET
+    @Path(EksRouteFilter.INTERNAL_PREFIX + "/access-policies")
+    public Response listAccessPolicies(@QueryParam("maxResults") String maxResults,
+                                       @QueryParam("nextToken") String nextToken) {
+        String partition = regionResolver.getPartition();
+        PaginatedResult<String> page = Pagination.paginate(accessPolicies.names(), policy -> policy,
+                EksAccessEntryService.pageSize(Pagination.parseMaxResults(maxResults, "InvalidParameterException")),
+                nextToken, "access-policies:" + partition,
+                token -> new AwsException("InvalidParameterException", "Invalid nextToken", 400));
+        List<Map<String, String>> policies = page.items().stream()
+                .map(policy -> Map.of("name", policy, "arn", EksAccessPolicyCatalog.arn(partition, policy)))
+                .toList();
+        return Response.ok(page.nextToken() == null ? Map.of("accessPolicies", policies)
+                : Map.of("accessPolicies", policies, "nextToken", page.nextToken())).build();
     }
 
     @DELETE
