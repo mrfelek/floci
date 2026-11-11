@@ -1809,6 +1809,21 @@ public class SsoAdminService implements Resettable, StoredResourceArns {
                 .sorted(Comparator.comparing(Assignment::principalId)).toList();
     }
 
+    /**
+     * The user name IAM Identity Center names a user's role sessions after (the session name in
+     * {@code assumed-role/AWSReservedSSO_.../<user name>}), from the identity store of the instance that holds
+     * {@code assignment}'s permission set.
+     */
+    public Optional<String> portalSessionName(Assignment assignment, String userId) {
+        try {
+            SsoInstance instance = requireInstance(instanceArnForPermissionSet(assignment.permissionSetArn()));
+            return identityStoreService.findUser(instance.identityStoreId(), userId)
+                    .map(user -> user.userName());
+        } catch (AwsException e) {
+            return Optional.empty();
+        }
+    }
+
     public List<Assignment> portalAssignmentsForUser(String userId) {
         validatePrincipalId(userId);
         Map<String, Set<String>> groupsByIdentityStore = new HashMap<>();

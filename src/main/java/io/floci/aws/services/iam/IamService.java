@@ -4807,6 +4807,20 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
         putSessionForAccount(accountId, sessionAccessKeyId, session);
     }
 
+    /** Stores a temporary credential in an explicit account namespace, as a role session named {@code roleSessionName}. */
+    public void registerSessionForAccount(String accountId, String sessionAccessKeyId, String secretAccessKey,
+                                          String sessionToken, String roleArn, Instant expiration,
+                                          String sessionPolicyDocument, String roleSessionName) {
+        if (accountId == null || accountId.isBlank()) {
+            throw new IllegalArgumentException("Session account ID must not be blank");
+        }
+        SessionCredential session = new SessionCredential(
+                sessionAccessKeyId, secretAccessKey, sessionToken, roleArn, expiration, sessionPolicyDocument,
+                accountId);
+        session.setRoleSessionName(roleSessionName);
+        putSessionForAccount(accountId, sessionAccessKeyId, session);
+    }
+
     /** An internal URL credential with both a session policy and an exact action/resource guard. */
     public void registerPresignedUrlSession(String accountId, String accessKeyId, String secretAccessKey,
                                             String sessionToken, Instant expiration, String policyDocument,
