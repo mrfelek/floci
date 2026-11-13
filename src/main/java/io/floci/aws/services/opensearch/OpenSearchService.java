@@ -630,6 +630,11 @@ public class OpenSearchService implements ResourceProvider {
                 this::legacyDomainDestinationKey, (accountId, domain) -> ownsAccount(domain, accountId));
     }
 
+    private void migrateLegacyDomainKeys(String accountId) {
+        domainStore.migrateLegacyEntries(accountId, key -> !key.contains("::"),
+                this::legacyDomainDestinationKey, domain -> ownsAccount(domain, accountId));
+    }
+
     /**
      * The region-scoped key for a legacy record, or null to leave it untouched when its ARN
      * cannot be parsed.
