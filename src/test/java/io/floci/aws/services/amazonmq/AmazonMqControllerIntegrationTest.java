@@ -5,6 +5,7 @@ import org.junit.jupiter.api.Test;
 
 import java.util.List;
 
+import static io.floci.aws.testing.EnforcementFixtures.auth;
 import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.hasItem;
@@ -17,7 +18,12 @@ import static org.hamcrest.Matchers.startsWith;
 class AmazonMqControllerIntegrationTest {
 
     private String createRabbitBroker(String name) {
+        return createRabbitBroker(name, "us-east-1");
+    }
+
+    private String createRabbitBroker(String name, String region) {
         return given()
+            .header("Authorization", auth("test", region, "mq"))
             .contentType("application/json")
             .body("""
                 {"brokerName": "%s", "engineType": "RABBITMQ",
@@ -201,5 +207,30 @@ class AmazonMqControllerIntegrationTest {
             .post("/v1/brokers")
         .then()
             .statusCode(400);
+    }
+
+    /** Brokers are Regional: another Region of the account neither lists, describes nor deletes one. */
+    @Test
+    void aBrokerIsSeenOnlyInTheRegionItWasCreatedIn() {
+        String brokerId = createRabbitBroker("it-regional", "eu-west-1");
+
+        given().header("Authorization", auth("test", "us-east-1", "mq"))
+        .when().get("/v1/brokers")
+        .then().statusCode(200).body("brokerSummaries.brokerId", not(hasItem(brokerId)));
+        given().header("Authorization", auth("test", "us-east-1", "mq"))
+        .when().get("/v1/brokers/{id}", brokerId)
+        .then().statusCode(404);
+        given().header("Authorization", auth("test", "us-east-1", "mq"))
+        .when().delete("/v1/brokers/{id}", brokerId)
+        .then().statusCode(404);
+        // The name is the eu-west-1 broker's only there.
+        createRabbitBroker("it-regional", "us-east-1");
+
+        given().header("Authorization", auth("test", "eu-west-1", "mq"))
+        .when().get("/v1/brokers")
+        .then().statusCode(200).body("brokerSummaries.brokerId", hasItem(brokerId));
+        given().header("Authorization", auth("test", "eu-west-1", "mq"))
+        .when().delete("/v1/brokers/{id}", brokerId)
+        .then().statusCode(200);
     }
 }

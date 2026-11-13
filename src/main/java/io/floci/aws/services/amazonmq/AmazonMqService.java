@@ -10,7 +10,6 @@ import io.floci.aws.core.resource.ExplorerResource;
 import io.floci.aws.core.resource.ResourceProvider;
 import io.floci.aws.core.resource.SupportedResourceType;
 import io.floci.aws.core.storage.AccountAwareStorageBackend;
-import io.floci.aws.core.storage.StorageBackend;
 import io.floci.aws.core.storage.StorageFactory;
 import io.floci.aws.services.amazonmq.container.RabbitMqManager;
 import io.floci.aws.services.amazonmq.model.Broker;
@@ -42,8 +41,10 @@ public class AmazonMqService implements ResourceProvider {
     private static final String ENGINE_RABBITMQ = "RABBITMQ";
     private static final String DEFAULT_ENGINE_VERSION = "3.13";
     private static final String DEPLOYMENT_SINGLE_INSTANCE = "SINGLE_INSTANCE";
+    private static final String KEY_SEPARATOR = "::";
 
-    private final StorageBackend<String, Broker> storage;
+    /** Brokers by {@code region::brokerId}, in their owner's account partition: brokers are Regional. */
+    private final AccountAwareStorageBackend<Broker> storage;
     private final EmulatorConfig config;
     private final RegionResolver regionResolver;
     private final RabbitMqManager rabbitMqManager;
@@ -61,6 +62,7 @@ public class AmazonMqService implements ResourceProvider {
 
     @PostConstruct
     public void init() {
+        migrateLegacyKeys();
         startReadinessPoller();
     }
 
@@ -114,13 +116,14 @@ public class AmazonMqService implements ResourceProvider {
         }
         validateUserPassword(admin.getPassword());
 
-        if (storage.scan(k -> true).stream().anyMatch(b -> name.equals(b.getBrokerName()))) {
+        String region = regionResolver.getRegion();
+        if (regionBrokers(region).stream().anyMatch(b -> name.equals(b.getBrokerName()))) {
             throw new AwsException("ConflictException", "Broker already exists: " + name, 409);
         }
 
         String brokerId = "b-" + UUID.randomUUID();
         String accountId = regionResolver.getAccountId();
-        String brokerArn = AwsArnUtils.Arn.of("mq", regionResolver.getRegion(), accountId,
+        String brokerArn = AwsArnUtils.Arn.of("mq", region, accountId,
                 "broker:" + name + ":" + brokerId).toString();
         String engineVersion = (params.engineVersion() == null || params.engineVersion().isBlank())
                 ? DEFAULT_ENGINE_VERSION : params.engineVersion();
@@ -161,7 +164,7 @@ public class AmazonMqService implements ResourceProvider {
                 rabbitMqManager.startContainer(broker);
             } catch (RuntimeException e) {
                 broker.setBrokerState(BrokerState.CREATION_FAILED);
-                storage.put(brokerId, broker);
+                storage.put(brokerKey(region, brokerId), broker);
                 // Keep the cause in the logs; don't leak internal details (or a null
                 // message) into the AWS error envelope returned to the client.
                 LOG.errorv(e, "Failed to provision broker {0} ({1})", name, brokerId);
@@ -170,19 +173,24 @@ public class AmazonMqService implements ResourceProvider {
             }
         }
 
-        storage.put(brokerId, broker);
+        storage.put(brokerKey(region, brokerId), broker);
         LOG.infov("Created Amazon MQ broker {0} ({1})", name, brokerId);
         return broker;
     }
 
     public Broker describeBroker(String brokerId) {
-        return storage.get(brokerId)
+        return storage.get(brokerKey(regionResolver.getRegion(), brokerId))
                 .orElseThrow(() -> new AwsException("NotFoundException",
                         "Broker not found: " + brokerId, 404));
     }
 
     public List<Broker> listBrokers() {
-        return storage.scan(k -> true);
+        return regionBrokers(regionResolver.getRegion());
+    }
+
+    /** The calling account's brokers in {@code region}. */
+    private List<Broker> regionBrokers(String region) {
+        return storage.scan(key -> key.startsWith(region + KEY_SEPARATOR));
     }
 
     @Override
@@ -215,7 +223,7 @@ public class AmazonMqService implements ResourceProvider {
             rabbitMqManager.stopContainer(broker);
             rabbitMqManager.removeBrokerStorage(broker);
         }
-        storage.delete(brokerId);
+        storage.delete(brokerKey(regionResolver.getRegion(), brokerId));
         LOG.infov("Deleted Amazon MQ broker {0}", brokerId);
     }
 
@@ -264,18 +272,36 @@ public class AmazonMqService implements ResourceProvider {
     }
 
     private List<Broker> allBrokers() {
-        if (storage instanceof AccountAwareStorageBackend<Broker> aware) {
-            return aware.scanAllAccounts();
-        }
-        return storage.scan(k -> true);
+        return storage.scanAllAccounts();
     }
 
+    /** Writes back a broker the poller read, under its owner's account and its own Region. */
     private void putBroker(Broker broker) {
-        if (broker.getAccountId() != null && storage instanceof AccountAwareStorageBackend<Broker> aware) {
-            aware.putForAccount(broker.getAccountId(), broker.getBrokerId(), broker);
+        if (broker.getAccountId() != null) {
+            storage.putForAccount(broker.getAccountId(), brokerKey(broker), broker);
         } else {
-            storage.put(broker.getBrokerId(), broker);
+            storage.put(brokerKey(broker), broker);
         }
+    }
+
+    static String brokerKey(String region, String brokerId) {
+        return region + KEY_SEPARATOR + brokerId;
+    }
+
+    /** A broker's key in its own Region, which its ARN has always named. */
+    private String brokerKey(Broker broker) {
+        return brokerKey(AwsArnUtils.regionOrDefault(broker.getBrokerArn(), config.defaultRegion()),
+                broker.getBrokerId());
+    }
+
+    /**
+     * Moves brokers persisted before they were keyed by Region, in every account, from the bare
+     * broker id onto the Region-scoped key, in the Region their ARN names. Each stays in the
+     * account partition that stored it.
+     */
+    private void migrateLegacyKeys() {
+        storage.migrateLegacyEntriesInEveryAccount(key -> !key.contains(KEY_SEPARATOR), this::brokerKey,
+                (accountId, broker) -> true);
     }
 
     // --- Users ---

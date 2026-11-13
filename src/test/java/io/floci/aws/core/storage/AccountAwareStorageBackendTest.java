@@ -305,6 +305,24 @@ class AccountAwareStorageBackendTest {
         assertFalse(raw.get("legacy").isPresent());
     }
 
+    /** Every account's legacy entries move within that account, an unprefixed one counting as the default's. */
+    @Test
+    void migrateLegacyEntriesInEveryAccountMovesEachWithinItsOwnAccount() {
+        InMemoryStorage<String, String> raw = new InMemoryStorage<>();
+        raw.put("gen0", "default-owned");
+        raw.put("123456789012/gen1", "account-owned");
+        raw.put("123456789012/kept", "not-owned");
+        raw.put("123456789012/us-east-1::current", "current");
+        AccountAwareStorageBackend<String> storage =
+                new AccountAwareStorageBackend<>(raw, null, "000000000000");
+
+        storage.migrateLegacyEntriesInEveryAccount(key -> !key.contains("::"), value -> "us-east-1::" + value,
+                (account, value) -> !value.equals("not-owned"));
+
+        assertEquals(Set.of("000000000000/us-east-1::default-owned", "123456789012/us-east-1::account-owned",
+                "123456789012/kept", "123456789012/us-east-1::current"), Set.copyOf(raw.keys()));
+    }
+
     @Test
     void migrateLegacyEntriesMovesGen1KeyAndDeletesExactSource() {
         InMemoryStorage<String, String> raw = new InMemoryStorage<>();
