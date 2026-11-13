@@ -232,6 +232,40 @@ class ResourceResolutionEnforcementIntegrationTest {
         }
     }
 
+    @Test
+    void volumeGrantsScopedLikeTheEbsCsiDriversApplyToTheVolumeAndInstanceARequestNames() {
+        String protectedVolume = "vol-0" + suffix();
+        UserCredentials keys = user(policy("""
+                {"Effect":"Allow","Action":"ec2:CreateVolume","Resource":"arn:aws:ec2:*:*:volume/*",
+                 "Condition":{"StringLike":{"aws:RequestTag/ebs.csi.aws.com/cluster":"true"}}},
+                {"Effect":"Allow","Action":"ec2:CreateTags","Resource":"arn:aws:ec2:*:*:volume/*",
+                 "Condition":{"StringEquals":{"ec2:CreateAction":"CreateVolume"}}},
+                {"Effect":"Allow","Action":["ec2:AttachVolume","ec2:DetachVolume"],
+                 "Resource":["arn:aws:ec2:*:*:volume/*","arn:aws:ec2:*:*:instance/*"]},
+                {"Effect":"Deny","Action":["ec2:AttachVolume","ec2:DetachVolume"],
+                 "Resource":"arn:aws:ec2:us-east-1:%s:volume/%s"}""".formatted(ACCOUNT, protectedVolume)));
+        try (Ec2Client caller = ec2Caller(keys)) {
+            String volume = caller.createVolume(r -> r.availabilityZone("us-east-1a").size(1)
+                    .tagSpecifications(t -> t.resourceType("volume")
+                            .tags(tag("ebs.csi.aws.com/cluster", "true")))).volumeId();
+            cleanup.register(() -> {
+                try (Ec2Client client = ec2Admin()) {
+                    client.deleteVolume(r -> r.volumeId(volume));
+                }
+            });
+            denied(() -> caller.createVolume(r -> r.availabilityZone("us-east-1a").size(1)));
+            // Allowed on the volume and the instance it names, the handler answers for an instance it does not have.
+            Ec2Exception missing = assertThrows(Ec2Exception.class, () -> caller.attachVolume(r -> r.volumeId(volume)
+                    .instanceId("i-0" + suffix()).device("/dev/xvdf")));
+            assertEquals(400, missing.statusCode());
+            assertTrue(missing.awsErrorDetails().errorCode().endsWith("NotFound"),
+                    missing.awsErrorDetails().errorCode());
+            denied(() -> caller.attachVolume(r -> r.volumeId(protectedVolume).instanceId("i-0" + suffix())
+                    .device("/dev/xvdf")));
+            denied(() -> caller.detachVolume(r -> r.volumeId(protectedVolume).instanceId("i-0" + suffix())));
+        }
+    }
+
     private UserCredentials user(String policy) {
         String name = "resource-reader-" + suffix();
         UserCredentials keys = EnforcementFixtures.createUser(cleanup, baseUri.getPort(), auth(ACCOUNT, "iam"), name);

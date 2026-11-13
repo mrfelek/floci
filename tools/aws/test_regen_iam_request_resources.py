@@ -1109,6 +1109,82 @@ def test_generated_ec2_targets_match_botocores_actual_serialization():
         assert target["prefixes"] == {"instance": "i-"}
 
 
+EC2_FORMATS = {"instance": "arn:${Partition}:ec2:${Region}:${Account}:instance/${InstanceId}",
+               "volume": "arn:${Partition}:ec2:${Region}:${Account}:volume/${VolumeId}",
+               "snapshot": "arn:${Partition}:ec2:${Region}::snapshot/${SnapshotId}"}
+
+
+def test_an_ec2_request_follows_the_rule_for_the_members_it_sends_as_the_reader_reads_them():
+    ec2 = model({"AttachVolume": {"InstanceId": "String", "VolumeId": "String"},
+                 "CreateVolume": {"SnapshotId": "String", "Size": "String"},
+                 "DetachVolumes": {"InstanceId": "String", "VolumeIds": "Strings"},
+                 "StartInstances": {"InstanceIds": "Strings"},
+                 "DeleteVolume": {"VolumeId": "String"}}, "ec2")
+    ec2["shapes"]["DetachVolumesIn"]["members"]["VolumeIds"]["locationName"] = "VolumeId"
+    ec2["shapes"]["DeleteVolumeIn"]["members"]["VolumeId"]["queryName"] = "Volume"
+    both = {"action": "", "types": ["instance", "volume"]}
+    assert r.entry_for("ec2:AttachVolume", both, EC2_FORMATS, {"ec2": ec2})["resources"] == [
+        {"type": "instance", "fill": {"InstanceId": "InstanceId"}},
+        {"type": "volume", "fill": {"VolumeId": "VolumeId"}}]
+    # A create names the snapshot it is made from and makes its own type, its id open.
+    assert r.entry_for("ec2:CreateVolume", {"action": "", "types": ["snapshot", "volume"]}, EC2_FORMATS,
+                       {"ec2": ec2})["resources"] == [{"type": "snapshot", "fill": {"SnapshotId": "SnapshotId"}},
+                                                      {"type": "volume", "fill": {}, "made": True}]
+    # A list, sent as VolumeId.1, names nothing the reader reads; what the request names otherwise still applies.
+    assert r.entry_for("ec2:DetachVolumes", both, EC2_FORMATS, {"ec2": ec2})["resources"] == [
+        {"type": "instance", "fill": {"InstanceId": "InstanceId"}}]
+    # Naming its instances in a list alone, a start is checked on `*`, not taken for a create of instance/*.
+    assert r.entry_for("ec2:StartInstances", both, EC2_FORMATS, {"ec2": ec2})["resources"] == []
+    # Nor is a member sent under another name than its own read.
+    assert r.entry_for("ec2:DeleteVolume", both, EC2_FORMATS, {"ec2": ec2})["resources"] == []
+    # The same requests in the AWS Query protocol, whose lists the reader reads, name the list's resources.
+    query = json.loads(json.dumps(ec2))
+    query["metadata"]["protocol"] = "query"
+    assert {"type": "volume", "fill": {"VolumeId": "VolumeIds[]"}} in r.entry_for(
+        "ec2:DetachVolumes", both, EC2_FORMATS, {"ec2": query})["resources"]
+
+
+def test_generated_ec2_resources_read_the_names_botocore_serializes_their_members_under():
+    import botocore.session
+    from botocore.serialize import create_serializer
+
+    document = json.loads(r.OUTPUT.read_text())
+    model = botocore.session.get_session().get_service_model("ec2")
+    # One member at a time, its request's other required members left out.
+    serializer = create_serializer("ec2", include_validation=False)
+    read = 0
+    for operation, entry in document["operations"].items():
+        if not operation.startswith("ec2:") or operation.split(":", 1)[1] not in model.operation_names:
+            continue
+        for resource in entry["resources"] + entry.get("creates", []) + entry.get("makes", []):
+            for path in r._member_paths(resource):
+                params: dict = {}
+                *parents, last = path.split(".")
+                node = params
+                for step in parents:
+                    node = node.setdefault(step, {})
+                node[last] = "x-1"
+                request = serializer.serialize_to_request(params, model.operation_model(operation.split(":", 1)[1]))
+                assert request["body"].get(path) == "x-1", (operation, path)
+                read += 1
+    assert read > 500
+    expected = {
+        "CreateVolume": [{"types": ["snapshot", "volume"], "arn": "OutpostArn"},
+                         {"type": "snapshot", "fill": {"SnapshotId": "SnapshotId"}},
+                         {"type": "volume", "fill": {}, "made": True}],
+        "AttachVolume": [{"type": "instance", "fill": {"InstanceId": "InstanceId"}},
+                         {"type": "volume", "fill": {"VolumeId": "VolumeId"}}],
+        "DeleteVolume": [{"type": "volume", "fill": {"VolumeId": "VolumeId"}}],
+        "CreateSnapshot": [{"types": ["snapshot", "volume"], "arn": "OutpostArn"},
+                           {"type": "snapshot", "fill": {}, "made": True},
+                           {"type": "volume", "fill": {"VolumeId": "VolumeId"}}],
+        "DeleteSnapshot": [{"type": "snapshot", "fill": {"SnapshotId": "SnapshotId"}}],
+        "DescribeVolumes": [], "TerminateInstances": [], "CreateTags": []}
+    for name, resources in expected.items():
+        assert document["operations"]["ec2:" + name]["resources"] == resources, name
+    assert document["operations"]["ec2:DetachVolume"]["resources"] == expected["AttachVolume"]
+
+
 def test_id_targets_reject_unknown_types_ambiguous_prefixes_and_malformed_members():
     import copy
 

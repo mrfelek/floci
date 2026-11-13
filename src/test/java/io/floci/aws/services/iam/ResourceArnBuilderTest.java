@@ -667,6 +667,44 @@ class ResourceArnBuilderTest {
     }
 
     @Test
+    void ec2VolumeRequestsAreCheckedOnTheVolumesInstancesAndSnapshotsTheyName() {
+        String volume = "arn:aws:ec2:us-east-1:000000000000:volume/";
+        String instance = "arn:aws:ec2:us-east-1:000000000000:instance/i-1";
+        String snapshot = "arn:aws:ec2:us-east-1::snapshot/";
+        setFormBody("Action=CreateVolume&AvailabilityZone=us-east-1a&Size=8&SnapshotId=snap-1"
+                + "&TagSpecification.1.ResourceType=volume"
+                + "&TagSpecification.1.Tag.1.Key=k&TagSpecification.1.Tag.1.Value=v");
+        assertEquals(List.of(snapshot + "snap-1", volume + "*"),
+                builder.buildResources("ec2", "ec2:CreateVolume", ctx, "us-east-1", ACCOUNT, "aws"));
+        setFormBody("Action=CreateVolume&AvailabilityZone=us-east-1a&Size=8");
+        assertEquals(List.of(volume + "*"),
+                builder.buildResources("ec2", "ec2:CreateVolume", ctx, "us-east-1", ACCOUNT, "aws"));
+        for (String operation : List.of("AttachVolume", "DetachVolume")) {
+            setFormBody("Action=" + operation + "&VolumeId=vol-1&InstanceId=i-1&Device=%2Fdev%2Fsdf");
+            assertEquals(List.of(instance, volume + "vol-1"),
+                    builder.buildResources("ec2", "ec2:" + operation, ctx, "us-east-1", ACCOUNT, "aws"));
+        }
+        for (String operation : List.of("DeleteVolume", "ModifyVolume")) {
+            setFormBody("Action=" + operation + "&VolumeId=vol-1&Size=16");
+            assertEquals(List.of(volume + "vol-1"),
+                    builder.buildResources("ec2", "ec2:" + operation, ctx, "us-east-1", ACCOUNT, "aws"));
+        }
+        setFormBody("Action=CreateSnapshot&VolumeId=vol-1");
+        assertEquals(List.of(snapshot + "*", volume + "vol-1"),
+                builder.buildResources("ec2", "ec2:CreateSnapshot", ctx, "us-east-1", ACCOUNT, "aws"));
+        setFormBody("Action=DeleteSnapshot&SnapshotId=snap-1");
+        assertEquals(List.of("arn:aws-cn:ec2:cn-north-1::snapshot/snap-1"),
+                builder.buildResources("ec2", "ec2:DeleteSnapshot", ctx, "cn-north-1", ACCOUNT, "aws-cn"));
+        // Instances an EC2 request names in a list (InstanceId.1) are not read: it stays on *, as do reads.
+        setFormBody("Action=TerminateInstances&InstanceId.1=i-1");
+        assertEquals(List.of("*"),
+                builder.buildResources("ec2", "ec2:TerminateInstances", ctx, "us-east-1", ACCOUNT, "aws"));
+        setFormBody("Action=DescribeVolumes&VolumeId.1=vol-1");
+        assertEquals(List.of("*"),
+                builder.buildResources("ec2", "ec2:DescribeVolumes", ctx, "us-east-1", ACCOUNT, "aws"));
+    }
+
+    @Test
     void instanceTagTargetsUseHandlerOrderFirstDuplicatesAndStopAtTheFirstGap() {
         queryParams.add("ResourceId.1", "i-query-decoy");
         setFormBody("Action=CreateTags&ResourceId.1=i-first&ResourceId.1=i-duplicate"
