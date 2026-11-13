@@ -266,12 +266,21 @@ class ElbClassicServiceTest {
         https.setSslCertificateId("arn:aws:iam::000000000000:server-certificate/scanned");
 
         ExecutorService pool = Executors.newFixedThreadPool(2);
-        CountDownLatch start = new CountDownLatch(1);
+        // The writes start only once the scan is running, so they overlap it however the threads
+        // are scheduled: started together, the writer could finish before the scanner first ran.
+        CountDownLatch scanning = new CountDownLatch(1);
         AtomicBoolean writing = new AtomicBoolean(true);
         try {
+            Future<?> scanner = pool.submit(() -> {
+                do {
+                    service.serverCertificateReferences();
+                    scanning.countDown();
+                } while (writing.get());
+                return null;
+            });
             Future<?> writer = pool.submit(() -> {
-                start.await();
                 try {
+                    assertTrue(scanning.await(30, TimeUnit.SECONDS), "the scan never started");
                     for (int i = 0; i < 400; i++) {
                         service.createLoadBalancerListeners(REGION, "scanned-elb", List.of(https));
                         service.deleteLoadBalancerListeners(REGION, "scanned-elb", List.of(443));
@@ -281,19 +290,9 @@ class ElbClassicServiceTest {
                 }
                 return null;
             });
-            Future<Integer> scanner = pool.submit(() -> {
-                start.await();
-                int scans = 0;
-                while (writing.get()) {
-                    service.serverCertificateReferences();
-                    scans++;
-                }
-                return scans;
-            });
-            start.countDown();
 
             writer.get(30, TimeUnit.SECONDS);
-            assertTrue(scanner.get(30, TimeUnit.SECONDS) > 0, "the scan never ran");
+            scanner.get(30, TimeUnit.SECONDS);
         } finally {
             pool.shutdownNow();
         }
