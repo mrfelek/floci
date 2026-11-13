@@ -117,6 +117,38 @@ class Ec2ServicePersistenceTest {
         assertEquals("ami-original", created.getData().getImageId());
     }
 
+    /** The reservation instances were launched in survives a restart, shared by all of them. */
+    @Test
+    void anInstancesReservationSurvivesRestart(@TempDir Path dir) {
+        String reservationId = XmlParser.extractFirst(query(newService(dir), "RunInstances",
+                "ImageId", "ami-0abcdef1234567890", "MinCount", "2", "MaxCount", "2"), "reservationId", null);
+
+        String described = query(newService(dir), "DescribeInstances");
+
+        assertEquals(List.of(reservationId), XmlParser.extractAll(described, "reservationId"), described);
+    }
+
+    /**
+     * An instance stored before its reservation was kept answers one derived from its id: the same on
+     * every call and after a restart.
+     */
+    @Test
+    void anInstanceStoredWithoutItsReservationAnswersAStableOne(@TempDir Path dir) throws IOException {
+        query(newService(dir), "RunInstances", "ImageId", "ami-0abcdef1234567890", "MinCount", "1", "MaxCount", "1");
+        Path instances = dir.resolve("ec2-instances.json");
+        Files.writeString(instances, Files.readString(instances).replaceAll("\"reservationId\"\\s*:\\s*\"r-[0-9a-f]+\",?", ""));
+
+        Ec2Service service = newService(dir);
+        List<String> first = XmlParser.extractAll(query(service, "DescribeInstances"), "reservationId");
+        List<String> second = XmlParser.extractAll(query(service, "DescribeInstances"), "reservationId");
+        List<String> restarted = XmlParser.extractAll(query(newService(dir), "DescribeInstances"), "reservationId");
+
+        assertEquals(1, first.size(), String.valueOf(first));
+        assertTrue(first.getFirst().matches("r-[0-9a-f]{17}"), first.getFirst());
+        assertEquals(first, second);
+        assertEquals(first, restarted);
+    }
+
     @Test
     void dhcpOptionsSurviveRestart(@TempDir Path dir) {
         Ec2Service original = newService(dir);

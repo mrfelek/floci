@@ -406,6 +406,31 @@ class Ec2ServiceTest {
         assertTrue(service.describeVolumes("us-east-1", List.of(), Map.of()).isEmpty());
     }
 
+    /**
+     * Instances launched together share the reservation RunInstances answered, and DescribeInstances
+     * answers it on every call; a separate launch has its own.
+     */
+    @Test
+    void describeInstancesAnswersTheReservationEachInstanceWasLaunchedIn() {
+        Ec2Service service = mockModeService();
+        String region = "us-east-1";
+        Reservation together = service.runInstances(region, "ami-test", "t3.micro", 3, 3, null, List.of(), null,
+                null, List.of(), null, null);
+        Reservation alone = service.runInstances(region, "ami-test", "t3.micro", 1, 1, null, List.of(), null,
+                null, List.of(), null, null);
+        Map<String, Set<String>> launched = Map.of(
+                together.getReservationId(), instanceIds(together), alone.getReservationId(), instanceIds(alone));
+
+        for (int call = 0; call < 2; call++) {
+            assertEquals(launched, service.describeInstances(region, List.of(), Map.of()).stream()
+                    .collect(Collectors.toMap(Reservation::getReservationId, Ec2ServiceTest::instanceIds)));
+        }
+    }
+
+    private static Set<String> instanceIds(Reservation reservation) {
+        return reservation.getInstances().stream().map(Instance::getInstanceId).collect(Collectors.toSet());
+    }
+
     @Test
     void describeInstancesScansTheVolumeStoreOnceWhateverTheInstanceCount() {
         InMemoryStorage<String, Volume> volumeStore = spy(new InMemoryStorage<String, Volume>());

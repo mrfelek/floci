@@ -4183,6 +4183,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
 
                             Instance inst = new Instance();
                             inst.setInstanceId(instanceId);
+                            inst.setReservationId(reservationId);
                             inst.setOwnerId(callerAccountId());
                             inst.setImageId(imageId);
                             inst.setState(InstanceState.pending());
@@ -4933,17 +4934,28 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                 .filter(i -> matchesFilters(i, filters, region))
                 .collect(Collectors.toList());
 
-        // Group into reservations (one instance per reservation for simplicity)
+        // Instances launched together share the reservation RunInstances answered, as on AWS.
         Map<String, Reservation> reservationMap = new LinkedHashMap<>();
         String ownerAccountId = callerAccountId();
         for (Instance inst : matched) {
-            Reservation res = new Reservation();
-            res.setReservationId("r-" + randomHex(17));
-            res.setOwnerId(ownerAccountId);
-            res.getInstances().add(inst);
-            reservationMap.put(inst.getInstanceId(), res);
+            reservationMap.computeIfAbsent(reservationIdOf(inst), reservationId -> {
+                Reservation res = new Reservation();
+                res.setReservationId(reservationId);
+                res.setOwnerId(ownerAccountId);
+                return res;
+            }).getInstances().add(inst);
         }
         return new ArrayList<>(reservationMap.values());
+    }
+
+    /**
+     * The reservation an instance answers in: the one RunInstances launched it in. An instance stored
+     * before its reservation was kept, or a cluster node EC2 did not launch, gets one derived from its
+     * id, so it too answers the same reservation on every call.
+     */
+    private static String reservationIdOf(Instance inst) {
+        return inst.getReservationId() != null ? inst.getReservationId()
+                : "r-" + Digests.sha256Hex(inst.getInstanceId()).substring(0, 17);
     }
 
     /**
@@ -6013,6 +6025,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         }
         Instance copy = new Instance();
         copy.setInstanceId(source.getInstanceId());
+        copy.setReservationId(source.getReservationId());
         copy.setImageId(source.getImageId());
         copy.setState(source.getState());
         copy.setStateTransitionReason(source.getStateTransitionReason());

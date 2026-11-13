@@ -14,6 +14,8 @@ import java.util.Map;
 public class Instance {
 
     private String instanceId;
+    // The reservation RunInstances launched the instance in; instances launched together share it.
+    private String reservationId;
     private String imageId;
     private volatile InstanceState state;
     private String stateTransitionReason;
@@ -110,6 +112,9 @@ public class Instance {
 
     public String getInstanceId() { return instanceId; }
     public void setInstanceId(String instanceId) { this.instanceId = instanceId; }
+
+    public String getReservationId() { return reservationId; }
+    public void setReservationId(String reservationId) { this.reservationId = reservationId; }
 
     public String getImageId() { return imageId; }
     public void setImageId(String imageId) { this.imageId = imageId; }
