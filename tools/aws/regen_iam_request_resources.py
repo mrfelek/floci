@@ -84,11 +84,16 @@ follow the rule unchanged: a family of a hand-built namespace whose requests nam
 way the rule reads them. `HAND_BUILT` are the namespaces `ResourceArnBuilder` builds resources for itself, and
 `NOT_COVERED` the ones Floci serves that are not read yet, each with its reason;
 `RequestResourceNamespacesIntegrationTest` fails for a served namespace in none of the three.
-`ID_TARGETS` stages heterogeneous id-list namespaces separately: botocore supplies the list member
+`ID_TARGETS` reads heterogeneous id lists separately: botocore supplies the list member
 and its serialized EC2 Query name (including queryName and capitalization), and documented id
 prefixes distinguish the supported resource types. Each generated `targets` entry preserves the
 request's order and duplicates, including a wildcard for each unsupported id; only resolved ARNs
-use the corresponding target's condition context. Other requests in those namespaces stay on `*`.
+use the corresponding target's condition context. The other requests of those namespaces follow the
+rule, less the resources an EC2 Query request names by a member it does not send as the reader reads
+it: in a list, which it numbers `<name>.<n>`, or under a name not its own (`TerminateInstances`'
+`InstanceIds`, sent as `InstanceId.1`, so it stays on `*`). `AttachVolume` names the instance and the
+volume its `InstanceId` and `VolumeId` give, and `CreateVolume` the snapshot its `SnapshotId` gives and
+the volume it makes, `volume/*`.
 `CORRECTIONS` gives an operation's resources where the rule gets them wrong, each with its reason; a
 resource there may apply only `when` a member has one of some values (`Type` picks the load balancer
 v2 `CreateLoadBalancer` creates), or `unless` it has, a member given a JSON null counting as absent
@@ -645,8 +650,8 @@ KNOWN_VARIABLES = {"Partition", "Region", "Account"}
 # A staged read of heterogeneous resource-id lists. The model supplies the member and its wire name;
 # the Service Reference supplies the action's types and their ARN formats. EC2 documents instance ids
 # with the i- prefix (EC2 User Guide, resource-ids). Only instances are covered here: other ids retain
-# a wildcard entry, and other EC2 requests retain their existing wildcard authorization until their
-# ARN resolution and condition contexts have coverage. No operation names select this read.
+# a wildcard entry. The namespace's other requests follow the rule (`read_as_sent`). No operation names
+# select this read.
 ID_TARGETS = {"ec2": {"member": "Resources", "prefixes": {"instance": "i-"}}}
 # An ARN format's account given as `${AccountId}`, the account `${Account}` gives in every other format.
 ACCOUNT_ID_SLOT_RE = re.compile(r"^(arn:[^:]*:[^:]*:[^:]*:)\$\{AccountId}:")
@@ -873,6 +878,47 @@ def request_members(models: dict[str, dict], operation: str) -> dict[str, str]:
             for path in _nested_arns(model, name, shape):
                 found.setdefault(path.removesuffix("[]"), path)
     return found
+
+
+def _serialized(name: str, member: dict) -> str:
+    """The name an EC2 Query request sends a member under, as botocore's serializer gives it: its `queryName`, or
+    else its `locationName` capitalized, or else its own."""
+    location = member.get("locationName", name)
+    return member.get("queryName", location[:1].upper() + location[1:])
+
+
+def read_as_sent(resources: list[dict], models: dict[str, dict], operation: str) -> list[dict]:
+    """The resources, less those an EC2 Query request names by a member it does not send as the reader reads it
+    (`_sent_as_read`), which the reader finds no value for; the others still apply. `TerminateInstances` names its
+    instances in `InstanceIds`, sent as `InstanceId.1`, and is checked on `*`."""
+    name = operation.split(":", 1)[1]
+    inputs = [(model, model["shapes"][spec["input"]["shape"]]) for model in models.values()
+              if "ec2" in _protocols(model) and "input" in (spec := model["operations"].get(name, {}))]
+    return [resource for resource in resources
+            if all(_sent_as_read(model, shape, path) for model, shape in inputs for path in _member_paths(resource))]
+
+
+def _sent_as_read(model: dict, shape: dict, path: str) -> bool:
+    """Whether an EC2 Query request sends the member at a vendored path as the reader reads it: each step under its
+    own name (`_serialized`), and none a list or a map, which the request numbers `<name>.<n>` where the reader reads
+    an AWS Query list's `<name>.member.<n>`."""
+    for step in path.split("."):
+        member = shape.get("members", {}).get(step)
+        if step.endswith(("[]", "{}")) or member is None or _serialized(step, member) != step:
+            return False
+        shape = model["shapes"][member["shape"]]
+    return True
+
+
+def _member_paths(resource: dict) -> list[str]:
+    """The paths of the members a resource reads: the one holding its ARN, filling its variables, finding it, naming
+    it through another or giving its account, and those it reads when they have a value, are `absent` or give an ARN
+    of another type."""
+    paths = [resource[key] for key in ("arn", "through", "account") if key in resource]
+    paths += list(resource.get("fill", {}).values()) + list(resource.get("find", []))
+    for key in ("when", "unless", "absent", "arnOf"):
+        paths += list(resource.get(key, {}))
+    return paths
 
 
 def enum_members(models: dict[str, dict], operation: str) -> dict[str, set[str]]:
@@ -1387,9 +1433,8 @@ def id_targets(operation: str, types: list[str], formats: dict[str, str], models
             variables = set(VARIABLE_RE.findall(formats[kind])) - KNOWN_VARIABLES
             if len(variables) != 1:
                 raise ValueError(f"{operation}: id target {kind} must have exactly one ARN variable")
-        location = member.get("locationName", configured["member"])
-        query = member.get("queryName", location[:1].upper() + location[1:])
-        target = {"member": configured["member"] + "[]", "query": query, "prefixes": prefixes}
+        target = {"member": configured["member"] + "[]", "query": _serialized(configured["member"], member),
+                  "prefixes": prefixes}
         if found is not None and found != target:
             raise ValueError(f"{operation}: clients disagree on the id target's serialization")
         found = target
@@ -1406,12 +1451,9 @@ def entry_for(operation: str, upstream: dict, formats: dict[str, str], models: d
     arn_members = {member for member, values in patterns.items()
                    if (kind_of(member) == "identifier" or stem(member) in ("", "resource"))
                    and values and all(only_arn(value) for value in values)}
-    if namespace_of(operation) in ID_TARGETS:
-        entry = {"action": upstream["action"], "types": types, "resources": []}
-        targets = id_targets(operation, types, formats, models)
-        if targets is not None:
-            entry["targets"] = targets
-        return entry
+    targets = id_targets(operation, types, formats, models)
+    if targets is not None:
+        return {"action": upstream["action"], "types": types, "resources": [], "targets": targets}
     if operation in CORRECTIONS:
         resources = CORRECTIONS[operation][0]
         endpoints = {model["metadata"]["endpointPrefix"] for model in models.values()}
@@ -1435,13 +1477,13 @@ def entry_for(operation: str, upstream: dict, formats: dict[str, str], models: d
         resources = with_map_fields(resources, types, formats, map_fields(models, operation.split(":", 1)[1]))
     resources = with_account(resources, formats, account_members(models, operation.split(":", 1)[1]))
     resources = with_arn_of(resources, formats, name_or_arn_members(models, operation.split(":", 1)[1]))
-    resources = with_made(resources, operation, formats)
+    resources = with_made(read_as_sent(resources, models, operation), operation, formats)
     entry = {"action": upstream["action"], "types": types, "resources": resources}
-    creates = creates_for(operation, types, formats, members)
+    creates = read_as_sent(creates_for(operation, types, formats, members), models, operation)
     if creates:
         entry["creates"] = creates
-    makes = makes_for(operation, types, formats, members, arn_members,
-                      path_labels(models, operation.split(":", 1)[1]))
+    makes = read_as_sent(makes_for(operation, types, formats, members, arn_members,
+                                   path_labels(models, operation.split(":", 1)[1])), models, operation)
     if makes:
         entry["makes"] = makes
     named = _named(resources) | _named(creates) | _named(makes)
