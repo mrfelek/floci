@@ -406,6 +406,63 @@ class Ec2ServiceTest {
         assertTrue(service.describeVolumes("us-east-1", List.of(), Map.of()).isEmpty());
     }
 
+    /**
+     * A launch whose instance ended terminated outside TerminateInstances, as a container launch
+     * that fails does: the first call to read its volumes applies what termination does, ending the
+     * attachments and deleting the DeleteOnTermination root volume. A dry run is one such read and
+     * changes nothing beyond it: afterwards the volumes are what a DescribeVolumes leaves, and each
+     * dry run answers as its real call would on them.
+     */
+    @ParameterizedTest
+    @CsvSource({
+            "DescribeVolumes, ''",
+            "DeleteVolume of the data volume, DryRunOperation",
+            "DeleteVolume of the root volume, InvalidVolume.NotFound",
+            "DetachVolume of the data volume, InvalidVolume.NotAttached",
+            "AttachVolume of the data volume, DryRunOperation"
+    })
+    void aDryRunLeavesAnEndedLaunchsVolumesAsADescribeVolumesDoes(String firstCall, String answer) {
+        Ec2Service service = new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
+                mock(Ec2PortForwardManager.class), mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class),
+                new Ec2InstanceTypeCatalog(), new InMemoryStorageFactory());
+        String region = "us-east-1";
+        String other = service.runInstances(region, "ami-test", "t3.micro", 1, 1, null, List.of(), null, null,
+                List.of(), null, null).getInstances().getFirst().getInstanceId();
+        Instance ended = launchKeepingADataVolume(service).getInstances().getFirst();
+        service.describeInstances(region, List.of(), Map.of());
+        Map<String, String> launchVolumes = service.describeVolumes(region, List.of(), Map.of()).stream()
+                .filter(volume -> !volume.getAttachments().isEmpty()
+                        && ended.getInstanceId().equals(volume.getAttachments().getFirst().getInstanceId()))
+                .collect(Collectors.toMap(volume -> volume.getAttachments().getFirst().getDevice(),
+                        Volume::getVolumeId));
+        String data = launchVolumes.remove("/dev/sdf");
+        String root = launchVolumes.values().iterator().next();
+        // What the container manager does when the launch's container fails.
+        ended.setState(InstanceState.terminated());
+
+        String code = switch (firstCall) {
+            case "DescribeVolumes" -> {
+                service.describeVolumes(region, List.of(), Map.of());
+                yield "";
+            }
+            case "DeleteVolume of the data volume" -> assertThrows(AwsException.class,
+                    () -> service.deleteVolume(region, data, true)).getErrorCode();
+            case "DeleteVolume of the root volume" -> assertThrows(AwsException.class,
+                    () -> service.deleteVolume(region, root, true)).getErrorCode();
+            case "DetachVolume of the data volume" -> assertThrows(AwsException.class,
+                    () -> service.detachVolume(region, data, null, null, false, true)).getErrorCode();
+            case "AttachVolume of the data volume" -> assertThrows(AwsException.class,
+                    () -> service.attachVolume(region, data, other, "/dev/sdg", true)).getErrorCode();
+            default -> throw new IllegalArgumentException(firstCall);
+        };
+
+        assertEquals(answer, code);
+        assertEquals(Map.of(data, "available, 0 attachments"), service.describeVolumes(region, List.of(), Map.of())
+                .stream().filter(volume -> volume.getVolumeId().equals(data) || volume.getVolumeId().equals(root))
+                .collect(Collectors.toMap(Volume::getVolumeId,
+                        volume -> volume.getState() + ", " + volume.getAttachments().size() + " attachments")));
+    }
+
     @Test
     void describeInstancesScansTheVolumeStoreOnceWhateverTheInstanceCount() {
         InMemoryStorage<String, Volume> volumeStore = spy(new InMemoryStorage<String, Volume>());
