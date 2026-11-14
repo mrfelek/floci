@@ -409,24 +409,43 @@ public class AutoScalingService implements PassedRoleLookup {
                 optionalFields != null ? optionalFields.desiredCapacityType() : null,
                 mixedInstancesPolicy);
 
-        AutoScalingGroup asg = new AutoScalingGroup();
-        asg.setAutoScalingGroupName(name);
-        asg.setAutoScalingGroupArn(groupArn(region, name));
+        AutoScalingGroup asg = newGroup(region, name, minSize, maxSize, desiredCapacity,
+                resolveAvailabilityZones(region, availabilityZones, subnetIds), subnetIds, terminationPolicies,
+                tags, tagPropagateAtLaunch);
         asg.setLaunchConfigurationName(launchConfigName);
         asg.setLaunchTemplateId(launchTemplateId);
         asg.setLaunchTemplateName(launchTemplateName);
         asg.setLaunchTemplateVersion(launchTemplateVersion);
         asg.setMixedInstancesPolicy(mixedInstancesPolicy);
-        asg.setMinSize(minSize);
-        asg.setMaxSize(maxSize);
-        asg.setDesiredCapacity(desiredCapacity);
         asg.setDefaultCooldown(defaultCooldown > 0 ? defaultCooldown : 300);
-        asg.setAvailabilityZones(new ArrayList<>(resolveAvailabilityZones(region, availabilityZones, subnetIds)));
-        asg.setSubnetIds(subnetIds != null ? new ArrayList<>(subnetIds) : new ArrayList<>());
         asg.setTargetGroupARNs(targetGroupArns != null ? new ArrayList<>(targetGroupArns) : new ArrayList<>());
         asg.setLoadBalancerNames(lbNames != null ? new ArrayList<>(lbNames) : new ArrayList<>());
         asg.setHealthCheckType(healthCheckType != null ? healthCheckType : "EC2");
         asg.setHealthCheckGracePeriod(healthCheckGracePeriod);
+        if (optionalFields != null) {
+            optionalFields.applyToNewGroup(asg);
+        }
+        groups.put(key, asg);
+        return asg;
+    }
+
+    /**
+     * A new group {@code name} in {@code region} with what every group is created with: its sizes, zones, subnets,
+     * termination policies, {@code Default} when none are given, and tags. The launch source is the caller's.
+     */
+    private AutoScalingGroup newGroup(String region, String name, int minSize, int maxSize, int desiredCapacity,
+                                      List<String> availabilityZones, List<String> subnetIds,
+                                      List<String> terminationPolicies, Map<String, String> tags,
+                                      Map<String, Boolean> tagPropagateAtLaunch) {
+        AutoScalingGroup asg = new AutoScalingGroup();
+        asg.setAutoScalingGroupName(name);
+        asg.setAutoScalingGroupArn(AwsArnUtils.Arn.of("autoscaling", region, regionResolver.getAccountId(),
+                "autoScalingGroup:" + name).toString());
+        asg.setMinSize(minSize);
+        asg.setMaxSize(maxSize);
+        asg.setDesiredCapacity(desiredCapacity);
+        asg.setAvailabilityZones(new ArrayList<>(availabilityZones));
+        asg.setSubnetIds(subnetIds != null ? new ArrayList<>(subnetIds) : new ArrayList<>());
         asg.setTerminationPolicies(terminationPolicies != null ? new ArrayList<>(terminationPolicies) : List.of("Default"));
         asg.setCreatedTime(Instant.now());
         asg.setRegion(region);
@@ -436,16 +455,7 @@ public class AutoScalingService implements PassedRoleLookup {
         if (tagPropagateAtLaunch != null) {
             asg.getTagPropagateAtLaunch().putAll(tagPropagateAtLaunch);
         }
-        if (optionalFields != null) {
-            optionalFields.applyToNewGroup(asg);
-        }
-        groups.put(key, asg);
         return asg;
-    }
-
-    private String groupArn(String region, String name) {
-        return AwsArnUtils.Arn.of("autoscaling", region, regionResolver.getAccountId(),
-                "autoScalingGroup:" + name).toString();
     }
 
     public void updateAutoScalingGroup(String region, String name,
@@ -526,16 +536,29 @@ public class AutoScalingService implements PassedRoleLookup {
 
     private List<String> resolveAvailabilityZones(String region, List<String> availabilityZones, List<String> subnetIds) {
         if ((availabilityZones == null || availabilityZones.isEmpty()) && subnetIds != null && !subnetIds.isEmpty()) {
-            List<Subnet> subnets = ec2Service.describeSubnets(region, subnetIds, null);
-            Set<String> foundIds = subnets.stream().map(Subnet::getSubnetId).collect(Collectors.toSet());
+            Map<String, String> zones = subnetZones(region, subnetIds);
             for (String subnetId : subnetIds) {
-                if (!foundIds.contains(subnetId)) {
+                if (!zones.containsKey(subnetId)) {
                     throw new AwsException("ValidationError", "The subnet ID '" + subnetId + "' does not exist", 400);
                 }
             }
-            return subnets.stream().map(Subnet::getAvailabilityZone).distinct().toList();
+            return zones.values().stream().distinct().toList();
         }
         return availabilityZones != null ? availabilityZones : List.of();
+    }
+
+    /**
+     * The zone of each subnet EC2 has among {@code subnetIds}, by subnet ID, in the order EC2 lists them. An ID EC2
+     * does not have is left out.
+     */
+    private Map<String, String> subnetZones(String region, List<String> subnetIds) {
+        Map<String, String> zones = new LinkedHashMap<>();
+        if (!subnetIds.isEmpty()) {
+            for (Subnet subnet : ec2Service.describeSubnets(region, subnetIds, null)) {
+                zones.put(subnet.getSubnetId(), subnet.getAvailabilityZone());
+            }
+        }
+        return zones;
     }
 
     /**
@@ -934,20 +957,14 @@ public class AutoScalingService implements PassedRoleLookup {
                 AutoScalingGroup asg = requireGroup(region, name);
                 // An instance belongs to one group at a time, so the whole batch fails before any tag changes.
                 List<String> conflicts = new ArrayList<>();
-                for (AutoScalingGroup group : groups.values()) {
-                    if (group == null || !region.equals(group.getRegion())) {
-                        continue;
-                    }
-                    // Under the group's own lock, which guards its member list against the reconciler.
-                    synchronized (lockFor(asgKey(region, group.getAutoScalingGroupName()))) {
-                        for (AsgInstance member : group.getInstances()) {
-                            if (requested.contains(member.getInstanceId())) {
-                                conflicts.add("The Instance: " + member.getInstanceId()
-                                        + " is already part of AutoScalingGroup:" + group.getAutoScalingGroupName());
-                            }
+                forEachGroupInRegion(region, group -> {
+                    for (AsgInstance member : group.getInstances()) {
+                        if (requested.contains(member.getInstanceId())) {
+                            conflicts.add("The Instance: " + member.getInstanceId()
+                                    + " is already part of AutoScalingGroup:" + group.getAutoScalingGroupName());
                         }
                     }
-                }
+                });
                 if (!conflicts.isEmpty()) {
                     throw new AwsException("ValidationError", conflicts.toString(), 400);
                 }
@@ -1006,6 +1023,22 @@ public class AutoScalingService implements PassedRoleLookup {
                         && "TargetGroupNotFound".equals(aws.getErrorCode()))) {
                     throw e;
                 }
+            }
+        }
+    }
+
+    /**
+     * Runs {@code action} on each group in {@code region}, under the group's own lock, which guards its member list
+     * against the reconciler. Callers hold the Region's lock, so no other change to which group holds an instance
+     * runs meanwhile.
+     */
+    private void forEachGroupInRegion(String region, Consumer<AutoScalingGroup> action) {
+        for (AutoScalingGroup group : groups.values()) {
+            if (group == null || !region.equals(group.getRegion())) {
+                continue;
+            }
+            synchronized (lockFor(asgKey(region, group.getAutoScalingGroupName()))) {
+                action.accept(group);
             }
         }
     }
@@ -1495,25 +1528,12 @@ public class AutoScalingService implements PassedRoleLookup {
             if (groups.containsKey(key)) {
                 return;
             }
-            AutoScalingGroup asg = new AutoScalingGroup();
-            asg.setAutoScalingGroupName(name);
-            asg.setAutoScalingGroupArn(groupArn(region, name));
-            asg.setMinSize(minSize);
-            asg.setMaxSize(maxSize);
-            asg.setDesiredCapacity(desiredCapacity);
-            List<String> zones = subnetIds.isEmpty() ? List.of()
-                    : ec2Service.describeSubnets(region, subnetIds, null).stream()
-                            .map(Subnet::getAvailabilityZone).distinct().toList();
-            asg.setAvailabilityZones(new ArrayList<>(zones));
-            asg.setSubnetIds(new ArrayList<>(subnetIds));
-            asg.setTerminationPolicies(List.of("Default"));
-            asg.setCreatedTime(Instant.now());
-            asg.setRegion(region);
+            Map<String, Boolean> propagateAtLaunch = new LinkedHashMap<>();
+            tags.keySet().forEach(tagKey -> propagateAtLaunch.put(tagKey, true));
+            AutoScalingGroup asg = newGroup(region, name, minSize, maxSize, desiredCapacity,
+                    subnetZones(region, subnetIds).values().stream().distinct().toList(), subnetIds, null,
+                    tags, propagateAtLaunch);
             asg.setEksManaged(true);
-            tags.forEach((tagKey, value) -> {
-                asg.getTags().put(tagKey, value);
-                asg.getTagPropagateAtLaunch().put(tagKey, true);
-            });
             groups.put(key, asg);
         }
     }
@@ -1616,17 +1636,12 @@ public class AutoScalingService implements PassedRoleLookup {
         }
         for (AsgInstance member : asg.getInstances()) {
             Set<String> leaving = new LinkedHashSet<>(targetGroupArns);
-            for (AutoScalingGroup other : groups.values()) {
-                if (other == null || !asg.getRegion().equals(other.getRegion())
-                        || asg.getAutoScalingGroupName().equals(other.getAutoScalingGroupName())) {
-                    continue;
+            forEachGroupInRegion(asg.getRegion(), other -> {
+                if (!asg.getAutoScalingGroupName().equals(other.getAutoScalingGroupName())
+                        && containsInstance(other, member.getInstanceId())) {
+                    leaving.removeAll(attachedTargetGroups(other));
                 }
-                synchronized (lockFor(asgKey(other.getRegion(), other.getAutoScalingGroupName()))) {
-                    if (containsInstance(other, member.getInstanceId())) {
-                        leaving.removeAll(attachedTargetGroups(other));
-                    }
-                }
-            }
+            });
             if (!leaving.isEmpty()) {
                 deregisterFromTargetGroups(elbV2Service, asg, leaving, List.of(member.getInstanceId()));
             }
