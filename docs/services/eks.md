@@ -385,6 +385,15 @@ Floci runs one k3s container per cluster. The worker node reflects the metadata 
 #### Timing and post-start nodegroups
 Kubelet flags are fixed when the cluster container starts. For nodegroups created while the cluster is already running, metadata is recorded in the EKS store and Floci logs an informational message that labels and taints are not applied to the running node. Surviving cluster containers are adopted as-is without rebuilding kubelet flags on restore.
 
+#### Auto Scaling group
+
+Each nodegroup has the Auto Scaling group that `DescribeNodegroup` names in `resources.autoScalingGroups`, in the nodegroup's account and Region. Its minimum, maximum and desired sizes are the nodegroup's `scalingConfig`, its subnets are the nodegroup's, and it is tagged `eks:cluster-name`, `eks:nodegroup-name`, `k8s.io/cluster-autoscaler/enabled=true` and `k8s.io/cluster-autoscaler/<cluster-name>=owned`. Its instance is the cluster's shared node, `InService` and `Healthy`, so the groups of all of a cluster's nodegroups list the same instance. A node that registers after the nodegroup was created joins the group then.
+
+- Attaching a target group to the group, with `AttachLoadBalancerTargetGroups` or as an `elbv2` traffic source with `AttachTrafficSources`, registers the node with it by instance id. Detaching it deregisters the node, unless the group of another of the cluster's nodegroups still has that target group attached.
+- Deleting the nodegroup deletes its group and deregisters the node the same way; deleting the cluster deletes the groups of its nodegroups.
+- Auto Scaling never launches, terminates or replaces the group's instance: setting its desired capacity changes only the capacity it reports.
+- Nodegroups created before Floci kept these groups get theirs at the next start.
+
 ### Metadata only inputs
 
 The remaining structured inputs are recorded as metadata:

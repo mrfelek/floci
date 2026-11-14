@@ -1,0 +1,134 @@
+package io.floci.aws.services.eks;
+
+import io.floci.aws.services.eks.model.Cluster;
+import io.floci.aws.testing.AlbFixtures;
+import io.floci.aws.testing.QueryRequests;
+import io.quarkus.test.junit.QuarkusTest;
+import io.restassured.path.xml.XmlPath;
+import io.restassured.specification.RequestSpecification;
+import jakarta.inject.Inject;
+import org.junit.jupiter.api.Test;
+
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.UUID;
+
+import static io.restassured.RestAssured.given;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+
+/**
+ * A managed node group's Auto Scaling group, the one {@code DescribeNodegroup} names in
+ * {@code resources.autoScalingGroups}, exists in Auto Scaling with the cluster's node in it. Attaching it to a target
+ * group, as Terraform's {@code aws_autoscaling_attachment} does, registers the node there, and deleting the node
+ * group deletes the group and deregisters the node.
+ */
+@QuarkusTest
+class EksNodegroupAutoScalingGroupIntegrationTest {
+
+    private static final String ACCOUNT = "271828182845";
+    private static final String REGION = "us-east-1";
+    private static final String SUBNET = "subnet-0123456789abcdef0";
+    private static final String GROUP =
+            "DescribeAutoScalingGroupsResponse.DescribeAutoScalingGroupsResult.AutoScalingGroups.member";
+    private static final String TARGETS =
+            "DescribeTargetHealthResponse.DescribeTargetHealthResult.TargetHealthDescriptions.member";
+
+    @Inject
+    EksService eksService;
+
+    @Inject
+    EksClusterManager clusterManager;
+
+    @Test
+    void attachingTheNodeGroupsAutoScalingGroupToATargetGroupRegistersTheClusterNode() {
+        String suffix = UUID.randomUUID().toString().substring(0, 8);
+        String clusterName = "ng-asg-" + suffix;
+        Cluster cluster = null;
+        String targetGroupArn = null;
+        try {
+            eks().body(Map.of("name", clusterName, "roleArn", "arn:aws:iam::" + ACCOUNT + ":role/cluster"))
+                    .post("/clusters").then().statusCode(200);
+            cluster = eksService.findAuthenticationCluster(ACCOUNT, REGION, clusterName).orElseThrow();
+            // EKS runs in mock mode here, so the node is registered as the k3s container's start registers it.
+            clusterManager.registerClusterNodeInstance(cluster, "mock-container-id");
+            String nodeId = clusterManager.getRegisteredClusterNodeInstance(cluster).getInstanceId();
+
+            String groupName = eks().body(Map.of(
+                            "nodegroupName", "workers",
+                            "nodeRole", "arn:aws:iam::" + ACCOUNT + ":role/node",
+                            "subnets", List.of(SUBNET),
+                            "scalingConfig", Map.of("minSize", 1, "maxSize", 3, "desiredSize", 2)))
+                    .post("/clusters/" + clusterName + "/node-groups").then().statusCode(200)
+                    .extract().path("nodegroup.resources.autoScalingGroups[0].name");
+
+            XmlPath described = describeGroup(groupName);
+            assertEquals(List.of(groupName), described.getList(GROUP + ".AutoScalingGroupName", String.class));
+            assertEquals("1", described.getString(GROUP + ".MinSize"));
+            assertEquals("3", described.getString(GROUP + ".MaxSize"));
+            assertEquals("2", described.getString(GROUP + ".DesiredCapacity"));
+            assertEquals(SUBNET, described.getString(GROUP + ".VPCZoneIdentifier"));
+            assertEquals(List.of(nodeId), described.getList(GROUP + ".Instances.member.InstanceId", String.class));
+            assertEquals("InService", described.getString(GROUP + ".Instances.member.LifecycleState"));
+            assertEquals("Healthy", described.getString(GROUP + ".Instances.member.HealthStatus"));
+            assertEquals(Map.of(
+                    "eks:cluster-name", clusterName,
+                    "eks:nodegroup-name", "workers",
+                    "k8s.io/cluster-autoscaler/enabled", "true",
+                    "k8s.io/cluster-autoscaler/" + clusterName, "owned"), tags(described));
+
+            targetGroupArn = AlbFixtures.createTargetGroup(ACCOUNT, clusterName, "instance", 80);
+            query("autoscaling", "AttachLoadBalancerTargetGroups",
+                    "AutoScalingGroupName", groupName, "TargetGroupARNs.member.1", targetGroupArn)
+                    .post("/").then().statusCode(200);
+
+            assertEquals(List.of(nodeId), targetIds(targetGroupArn));
+
+            eks().delete("/clusters/" + clusterName + "/node-groups/workers").then().statusCode(200);
+
+            assertEquals(List.of(), describeGroup(groupName).getList(GROUP + ".AutoScalingGroupName", String.class));
+            assertEquals(List.of(), targetIds(targetGroupArn));
+        } finally {
+            eks().delete("/clusters/" + clusterName + "/node-groups/workers");
+            eks().delete("/clusters/" + clusterName);
+            AlbFixtures.deleteTargetGroup(ACCOUNT, targetGroupArn);
+            if (cluster != null) {
+                clusterManager.unregisterMetadataEndpoint(cluster);
+            }
+        }
+    }
+
+    private static RequestSpecification eks() {
+        return given()
+                .header("Authorization", "AWS4-HMAC-SHA256 Credential=" + ACCOUNT + "/20261114/" + REGION
+                        + "/eks/aws4_request, SignedHeaders=host, Signature=abc")
+                .contentType("application/json");
+    }
+
+    private static RequestSpecification query(String service, String action, String... params) {
+        return QueryRequests.request(ACCOUNT, REGION, service, action, params);
+    }
+
+    private static XmlPath describeGroup(String groupName) {
+        return query("autoscaling", "DescribeAutoScalingGroups", "AutoScalingGroupNames.member.1", groupName)
+                .post("/").then().statusCode(200).extract().xmlPath();
+    }
+
+    private static Map<String, String> tags(XmlPath described) {
+        List<String> keys = described.getList(GROUP + ".Tags.member.Key", String.class);
+        List<String> values = described.getList(GROUP + ".Tags.member.Value", String.class);
+        assertEquals(List.of("true", "true", "true", "true"),
+                described.getList(GROUP + ".Tags.member.PropagateAtLaunch", String.class));
+        Map<String, String> tags = new HashMap<>();
+        for (int i = 0; i < keys.size(); i++) {
+            tags.put(keys.get(i), values.get(i));
+        }
+        return tags;
+    }
+
+    private static List<String> targetIds(String targetGroupArn) {
+        return query("elasticloadbalancing", "DescribeTargetHealth", "TargetGroupArn", targetGroupArn)
+                .post("/").then().statusCode(200).extract().xmlPath()
+                .getList(TARGETS + ".Target.Id", String.class);
+    }
+}

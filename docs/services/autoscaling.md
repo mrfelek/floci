@@ -270,6 +270,7 @@ Floci runs a background reconciler (10 s fixed rate) that keeps each group's InS
 - **Scale-out**: calls `RunInstances` with the group's launch configuration; new instances are tracked as `Pending` until the EC2 state transitions to `running`, at which point they move to `InService` and are registered with all attached ELB v2 target groups.
 - **Scale-in**: selects InService instances not protected from scale-in, deregisters them from target groups, then calls `TerminateInstances`.
 - Activity records are written on each scale-out and scale-in event.
+- **EKS nodegroups**: the group EKS keeps for a managed nodegroup is left alone. Its instance is the cluster's node, which the reconciler never launches, terminates or replaces, so attaching a target group to such a group registers the node at once and detaching it deregisters the node. See the [EKS nodegroup Auto Scaling group](eks.md#auto-scaling-group).
 
 `SuspendProcesses` pauses desired-capacity scale-out for `Launch` and scale-in for
 `Terminate`. The desired count remains stored, and `ResumeProcesses` allows the
