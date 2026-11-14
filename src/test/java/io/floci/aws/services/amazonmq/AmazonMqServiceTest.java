@@ -10,36 +10,36 @@ import io.floci.aws.services.amazonmq.container.RabbitMqManager;
 import io.floci.aws.services.amazonmq.model.Broker;
 import io.floci.aws.services.amazonmq.model.BrokerState;
 import io.floci.aws.services.amazonmq.model.MqUser;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.Mockito;
 
+import java.time.Duration;
 import java.util.List;
 
+import static org.awaitility.Awaitility.await;
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.Mockito.when;
 
 class AmazonMqServiceTest {
 
+    private static final String ACCOUNT = "000000000000";
+
+    private AccountAwareStorageBackend<Broker> brokers;
+    private RegionResolver regionResolver;
     private AmazonMqService service;
 
     @BeforeEach
     void setUp() {
-        StorageFactory storageFactory = Mockito.mock(StorageFactory.class);
-        when(storageFactory.create(Mockito.anyString(), Mockito.anyString(), Mockito.any()))
-                .thenReturn(AccountAwareStorageBackend.inMemory("000000000000"));
+        brokers = AccountAwareStorageBackend.inMemory(ACCOUNT);
+        regionResolver = Mockito.spy(new RegionResolver("us-east-1", ACCOUNT));
+        service = newService(true, Mockito.mock(RabbitMqManager.class));
+    }
 
-        EmulatorConfig config = Mockito.mock(EmulatorConfig.class);
-        EmulatorConfig.ServicesConfig servicesConfig = Mockito.mock(EmulatorConfig.ServicesConfig.class);
-        EmulatorConfig.AmazonMqServiceConfig mqConfig = Mockito.mock(EmulatorConfig.AmazonMqServiceConfig.class);
-        when(config.services()).thenReturn(servicesConfig);
-        when(servicesConfig.amazonmq()).thenReturn(mqConfig);
-        when(mqConfig.mock()).thenReturn(true);
-        when(config.defaultRegion()).thenReturn("us-east-1");
-
-        RegionResolver regionResolver = new RegionResolver("us-east-1", "000000000000");
-        RabbitMqManager rabbitMqManager = Mockito.mock(RabbitMqManager.class);
-        service = new AmazonMqService(storageFactory, config, regionResolver, rabbitMqManager);
+    @AfterEach
+    void stopPoller() {
+        service.shutdown();
     }
 
     private CreateBrokerParams rabbitParams(String name) {
@@ -185,23 +185,103 @@ class AmazonMqServiceTest {
         assertThrows(AwsException.class, () -> realModeService.rebootBroker(failed.getBrokerId()));
     }
 
+    /** Brokers are Regional: another Region of the account neither lists, describes, reboots nor deletes one. */
+    @Test
+    void aBrokerIsSeenOnlyInItsOwnRegion() {
+        String brokerId = service.createBroker(rabbitParams("orders")).getBrokerId();
+
+        inRegion("eu-west-1");
+        assertEquals(List.of(), service.listBrokers());
+        assertEquals("NotFoundException",
+                assertThrows(AwsException.class, () -> service.describeBroker(brokerId)).getErrorCode());
+        assertEquals("NotFoundException",
+                assertThrows(AwsException.class, () -> service.rebootBroker(brokerId)).getErrorCode());
+        assertEquals("NotFoundException",
+                assertThrows(AwsException.class, () -> service.deleteBroker(brokerId)).getErrorCode());
+
+        inRegion("us-east-1");
+        assertEquals(List.of(brokerId), service.listBrokers().stream().map(Broker::getBrokerId).toList());
+        assertEquals("orders", service.describeBroker(brokerId).getBrokerName());
+    }
+
+    @Test
+    void aBrokerNameIsUniqueWithinItsRegionOnly() {
+        service.createBroker(rabbitParams("orders"));
+
+        inRegion("eu-west-1");
+        Broker inIreland = service.createBroker(rabbitParams("orders"));
+        assertEquals("arn:aws:mq:eu-west-1:" + ACCOUNT + ":broker:orders:" + inIreland.getBrokerId(),
+                inIreland.getBrokerArn());
+
+        inRegion("us-east-1");
+        assertEquals("ConflictException",
+                assertThrows(AwsException.class, () -> service.createBroker(rabbitParams("orders"))).getErrorCode());
+    }
+
+    /** A broker stored before brokers were keyed by Region moves, at startup, to the Region its ARN names. */
+    @Test
+    void aBrokerStoredUnderItsBareIdMovesToItsArnsRegionOnStartup() {
+        Broker legacy = new Broker("b-legacy", "arn:aws:mq:eu-west-1:" + ACCOUNT + ":broker:legacy:b-legacy",
+                "legacy", "RABBITMQ", "3.13", "SINGLE_INSTANCE", "mq.t3.micro");
+        legacy.setAccountId(ACCOUNT);
+        legacy.setBrokerState(BrokerState.RUNNING);
+        brokers.put("b-legacy", legacy);
+
+        service.init();
+
+        assertEquals(List.of(AmazonMqService.brokerKey("eu-west-1", "b-legacy")),
+                List.copyOf(brokers.keys()));
+        inRegion("eu-west-1");
+        assertEquals("legacy", service.describeBroker("b-legacy").getBrokerName());
+        inRegion("us-east-1");
+        assertEquals(List.of(), service.listBrokers());
+    }
+
+    /**
+     * The readiness poller writes a broker back under the account and the key it is stored under, even
+     * for a record that names no account, as one written before brokers carried theirs.
+     */
+    @Test
+    void aBrokerTurningReadyStaysInItsAccountAndRegion() {
+        RabbitMqManager readyManager = Mockito.mock(RabbitMqManager.class);
+        when(readyManager.isReady(Mockito.any())).thenReturn(true);
+        service = newService(false, readyManager);
+        Broker starting = new Broker("b-starting", "arn:aws:mq:eu-west-1:111111111111:broker:starting:b-starting",
+                "starting", "RABBITMQ", "3.13", "SINGLE_INSTANCE", "mq.t3.micro");
+        starting.setBrokerState(BrokerState.CREATION_IN_PROGRESS);
+        String key = AmazonMqService.brokerKey("eu-west-1", "b-starting");
+        brokers.putForAccount("111111111111", key, starting);
+
+        service.init();
+
+        await().atMost(Duration.ofSeconds(10)).untilAsserted(() -> assertEquals(BrokerState.RUNNING,
+                brokers.getForAccount("111111111111", key).map(Broker::getBrokerState).orElse(null)));
+        assertEquals(1, brokers.scanAllAccounts().size());
+    }
+
     private AmazonMqService realModeServiceWithFailingManager() {
+        RabbitMqManager failingManager = Mockito.mock(RabbitMqManager.class);
+        Mockito.doThrow(new RuntimeException("docker unavailable"))
+                .when(failingManager).startContainer(Mockito.any());
+        return newService(false, failingManager);
+    }
+
+    /** A service over {@link #brokers} answering in the Region {@link #regionResolver} gives. */
+    private AmazonMqService newService(boolean mock, RabbitMqManager rabbitMqManager) {
         StorageFactory storageFactory = Mockito.mock(StorageFactory.class);
-        when(storageFactory.create(Mockito.anyString(), Mockito.anyString(), Mockito.any()))
-                .thenReturn(AccountAwareStorageBackend.inMemory("000000000000"));
+        Mockito.doReturn(brokers).when(storageFactory).create(Mockito.anyString(), Mockito.anyString(), Mockito.any());
 
         EmulatorConfig config = Mockito.mock(EmulatorConfig.class);
         EmulatorConfig.ServicesConfig servicesConfig = Mockito.mock(EmulatorConfig.ServicesConfig.class);
         EmulatorConfig.AmazonMqServiceConfig mqConfig = Mockito.mock(EmulatorConfig.AmazonMqServiceConfig.class);
         when(config.services()).thenReturn(servicesConfig);
         when(servicesConfig.amazonmq()).thenReturn(mqConfig);
-        when(mqConfig.mock()).thenReturn(false);
+        when(mqConfig.mock()).thenReturn(mock);
         when(config.defaultRegion()).thenReturn("us-east-1");
+        return new AmazonMqService(storageFactory, config, regionResolver, rabbitMqManager);
+    }
 
-        RegionResolver regionResolver = new RegionResolver("us-east-1", "000000000000");
-        RabbitMqManager failingManager = Mockito.mock(RabbitMqManager.class);
-        Mockito.doThrow(new RuntimeException("docker unavailable"))
-                .when(failingManager).startContainer(Mockito.any());
-        return new AmazonMqService(storageFactory, config, regionResolver, failingManager);
+    private void inRegion(String region) {
+        Mockito.doReturn(region).when(regionResolver).getRegion();
     }
 }
