@@ -1,5 +1,6 @@
 package io.floci.aws.services.autoscaling;
 
+import io.floci.aws.core.common.AwsException;
 import io.floci.aws.core.common.RegionResolver;
 import io.floci.aws.services.autoscaling.model.AsgInstance;
 import io.floci.aws.services.autoscaling.model.AutoScalingGroup;
@@ -9,17 +10,26 @@ import io.floci.aws.services.ec2.model.Placement;
 import io.floci.aws.services.ec2.model.Subnet;
 import io.floci.aws.services.elbv2.ElbV2Service;
 import io.floci.aws.services.elbv2.model.TargetDescription;
+import io.floci.aws.testing.ThreadStates;
 import org.junit.jupiter.api.Test;
 
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.FutureTask;
+import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.Mockito.anyList;
 import static org.mockito.Mockito.argThat;
 import static org.mockito.Mockito.clearInvocations;
+import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.eq;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verify;
@@ -38,11 +48,6 @@ class AutoScalingEksManagedGroupTest {
     private static final String FIRST = "eks-workers-1a2b3c4d";
     private static final String SECOND = "eks-batch-5e6f7a8b";
     private static final String NODE = "i-0123456789abcdef0";
-    private static final Map<String, String> TAGS = Map.of(
-            "eks:cluster-name", "shop",
-            "eks:nodegroup-name", "workers",
-            "k8s.io/cluster-autoscaler/enabled", "true",
-            "k8s.io/cluster-autoscaler/shop", "owned");
 
     private final ElbV2Service targets = mock(ElbV2Service.class);
     private final Ec2Service ec2 = mock(Ec2Service.class);
@@ -60,7 +65,7 @@ class AutoScalingEksManagedGroupTest {
         subnet.setAvailabilityZone("us-east-1a");
         when(ec2.describeSubnets(REGION, List.of("subnet-a", "subnet-unknown"), null)).thenReturn(List.of(subnet));
 
-        service.createEksManagedGroup(REGION, FIRST, 1, 3, 2, List.of("subnet-a", "subnet-unknown"), TAGS);
+        service.createEksManagedGroup(REGION, FIRST, 1, 3, 2, List.of("subnet-a", "subnet-unknown"), tags("workers"));
 
         AutoScalingGroup group = service.requireGroup(REGION, FIRST);
         assertTrue(group.isEksManaged());
@@ -71,7 +76,7 @@ class AutoScalingEksManagedGroupTest {
         assertEquals(2, group.getDesiredCapacity());
         assertEquals(List.of("us-east-1a"), group.getAvailabilityZones());
         assertEquals(List.of("subnet-a", "subnet-unknown"), group.getSubnetIds());
-        assertEquals(TAGS, group.getTags());
+        assertEquals(tags("workers"), group.getTags());
         assertEquals(Map.of("eks:cluster-name", true, "eks:nodegroup-name", true,
                 "k8s.io/cluster-autoscaler/enabled", true, "k8s.io/cluster-autoscaler/shop", true),
                 group.getTagPropagateAtLaunch());
@@ -89,12 +94,12 @@ class AutoScalingEksManagedGroupTest {
         assertEquals(1, group.getMinSize());
         assertEquals(3, group.getMaxSize());
         assertEquals(2, group.getDesiredCapacity());
-        assertEquals(TAGS, group.getTags());
+        assertEquals(tags("workers"), group.getTags());
     }
 
     @Test
     void anAddedNodeIsInServiceAndRegisteredWithTheTargetGroupsAlreadyAttached() {
-        service.createEksManagedGroup(REGION, FIRST, 1, 3, 2, List.of(), TAGS);
+        service.createEksManagedGroup(REGION, FIRST, 1, 3, 2, List.of(), tags("workers"));
         service.attachLoadBalancerTargetGroups(REGION, FIRST, List.of("tg-attached"));
         service.attachTrafficSources(REGION, FIRST, List.of(
                 new AutoScalingService.TrafficSourceIdentifier("tg-source", "elbv2"),
@@ -120,7 +125,7 @@ class AutoScalingEksManagedGroupTest {
 
     @Test
     void attachingAndDetachingTargetGroupsRegistersAndDeregistersTheNode() {
-        service.createEksManagedGroup(REGION, FIRST, 1, 3, 2, List.of(), TAGS);
+        service.createEksManagedGroup(REGION, FIRST, 1, 3, 2, List.of(), tags("workers"));
         service.addEksManagedInstance(REGION, FIRST, node());
 
         service.attachLoadBalancerTargetGroups(REGION, FIRST, List.of("tg-a"));
@@ -146,11 +151,45 @@ class AutoScalingEksManagedGroupTest {
     }
 
     @Test
+    void detachingATargetGroupLeavesTheSharedNodeInItWhileAnotherGroupHasItAttached() {
+        groupsSharingTheNode();
+        service.attachLoadBalancerTargetGroups(REGION, FIRST, List.of("tg-shared"));
+        service.attachTrafficSources(REGION, SECOND, List.of(
+                new AutoScalingService.TrafficSourceIdentifier("tg-shared", "elbv2")));
+        clearInvocations(targets);
+
+        service.detachLoadBalancerTargetGroups(REGION, FIRST, List.of("tg-shared"));
+
+        verifyNoInteractions(targets);
+
+        service.detachTrafficSources(REGION, SECOND, List.of(
+                new AutoScalingService.TrafficSourceIdentifier("tg-shared", "elbv2")));
+
+        verify(targets).deregisterTargets(eq(REGION), eq("tg-shared"), only(NODE));
+        verifyNoMoreInteractions(targets);
+    }
+
+    @Test
+    void detachingTheNodeLeavesTheTargetGroupsAnotherGroupHoldingItHasAttached() {
+        groupsSharingTheNode();
+        service.attachLoadBalancerTargetGroups(REGION, FIRST, List.of("tg-first", "tg-shared"));
+        service.attachTrafficSources(REGION, FIRST, List.of(
+                new AutoScalingService.TrafficSourceIdentifier("tg-source", "elbv2")));
+        service.attachLoadBalancerTargetGroups(REGION, SECOND, List.of("tg-shared"));
+        clearInvocations(targets);
+
+        service.detachInstances(REGION, FIRST, List.of(NODE), false);
+
+        assertEquals(List.of(), memberIds(FIRST));
+        assertEquals(List.of(NODE), memberIds(SECOND));
+        verify(targets).deregisterTargets(eq(REGION), eq("tg-first"), only(NODE));
+        verify(targets).deregisterTargets(eq(REGION), eq("tg-source"), only(NODE));
+        verifyNoMoreInteractions(targets);
+    }
+
+    @Test
     void deletingAGroupLeavesTheSharedNodeInTheTargetGroupsAnotherGroupHolds() {
-        service.createEksManagedGroup(REGION, FIRST, 1, 3, 2, List.of(), TAGS);
-        service.createEksManagedGroup(REGION, SECOND, 1, 1, 1, List.of(), TAGS);
-        service.addEksManagedInstance(REGION, FIRST, node());
-        service.addEksManagedInstance(REGION, SECOND, node());
+        groupsSharingTheNode();
         service.attachLoadBalancerTargetGroups(REGION, FIRST, List.of("tg-first", "tg-shared"));
         service.attachLoadBalancerTargetGroups(REGION, SECOND, List.of("tg-shared"));
         clearInvocations(targets);
@@ -169,6 +208,85 @@ class AutoScalingEksManagedGroupTest {
         verifyNoMoreInteractions(targets);
         // The node is EKS's: deleting its groups terminates nothing.
         verifyNoInteractions(ec2);
+    }
+
+    @Test
+    void deletingAnEksGroupThroughAutoScalingTerminatesNothingAndKeepsSharedTargetGroups() {
+        groupsSharingTheNode();
+        service.attachLoadBalancerTargetGroups(REGION, FIRST, List.of("tg-first", "tg-shared"));
+        service.attachLoadBalancerTargetGroups(REGION, SECOND, List.of("tg-shared"));
+        clearInvocations(targets);
+
+        AwsException inUse = assertThrows(AwsException.class,
+                () -> service.deleteAutoScalingGroup(REGION, FIRST, false));
+        assertEquals("ResourceInUse", inUse.getErrorCode());
+
+        service.deleteAutoScalingGroup(REGION, FIRST, true);
+
+        assertEquals(List.of(), service.describeAutoScalingGroups(REGION, List.of(FIRST)));
+        verify(targets).deregisterTargets(eq(REGION), eq("tg-first"), only(NODE));
+        verifyNoMoreInteractions(targets);
+        verifyNoInteractions(ec2);
+    }
+
+    @Test
+    void attachingWhileAnotherGroupDetachesTheSameTargetGroupLeavesTheSharedNodeRegistered() throws Exception {
+        groupsSharingTheNode();
+        // The target group's registered targets, as ELB keeps them.
+        Set<String> registered = ConcurrentHashMap.newKeySet();
+        CountDownLatch deregistering = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        doAnswer(invocation -> {
+            List<TargetDescription> described = invocation.getArgument(2);
+            described.forEach(target -> registered.add(target.getId()));
+            return null;
+        }).when(targets).registerTargets(eq(REGION), eq("tg-shared"), anyList());
+        doAnswer(invocation -> {
+            deregistering.countDown();
+            assertTrue(release.await(5, TimeUnit.SECONDS), "the parked deregistration was not released");
+            List<TargetDescription> described = invocation.getArgument(2);
+            described.forEach(target -> registered.remove(target.getId()));
+            return null;
+        }).when(targets).deregisterTargets(eq(REGION), eq("tg-shared"), anyList());
+        service.attachLoadBalancerTargetGroups(REGION, FIRST, List.of("tg-shared"));
+        assertEquals(Set.of(NODE), registered);
+
+        // FIRST's detach finds no other group with tg-shared and parks deregistering the node from it.
+        FutureTask<Void> detach = new FutureTask<>(
+                () -> service.detachLoadBalancerTargetGroups(REGION, FIRST, List.of("tg-shared")), null);
+        FutureTask<Void> attach = new FutureTask<>(
+                () -> service.attachLoadBalancerTargetGroups(REGION, SECOND, List.of("tg-shared")), null);
+        Thread detaching = Thread.ofPlatform().daemon().start(detach);
+        Thread attaching = Thread.ofPlatform().daemon().unstarted(attach);
+        try {
+            assertTrue(deregistering.await(5, TimeUnit.SECONDS), "the detach did not reach the deregistration");
+            attaching.start();
+            ThreadStates.awaitBlockedOrDone(attaching);
+            assertEquals(Thread.State.BLOCKED, attaching.getState());
+        } finally {
+            release.countDown();
+        }
+        detach.get(5, TimeUnit.SECONDS);
+        attach.get(5, TimeUnit.SECONDS);
+        detaching.join(5000);
+
+        assertEquals(Set.of(NODE), registered);
+    }
+
+    /** FIRST and SECOND, the groups of two node groups of one cluster, both holding its node. */
+    private void groupsSharingTheNode() {
+        service.createEksManagedGroup(REGION, FIRST, 1, 3, 2, List.of(), tags("workers"));
+        service.createEksManagedGroup(REGION, SECOND, 1, 1, 1, List.of(), tags("batch"));
+        service.addEksManagedInstance(REGION, FIRST, node());
+        service.addEksManagedInstance(REGION, SECOND, node());
+    }
+
+    private static Map<String, String> tags(String nodegroupName) {
+        return Map.of(
+                "eks:cluster-name", "shop",
+                "eks:nodegroup-name", nodegroupName,
+                "k8s.io/cluster-autoscaler/enabled", "true",
+                "k8s.io/cluster-autoscaler/shop", "owned");
     }
 
     private List<String> memberIds(String group) {
