@@ -982,13 +982,44 @@ public class AutoScalingService implements PassedRoleLookup {
         }
     }
 
+    /**
+     * Registers {@code instanceId} with each of {@code targetGroupArns}. A target group that refuses it is logged
+     * and skipped, unless {@code strict}: then only a target group that is gone is skipped, and any other failure
+     * is thrown.
+     */
+    static void registerWithTargetGroups(ElbV2Service elb, AutoScalingGroup asg, Collection<String> targetGroupArns,
+                                         String instanceId, boolean strict) {
+        for (String tgArn : targetGroupArns) {
+            try {
+                TargetDescription td = new TargetDescription();
+                td.setId(instanceId);
+                elb.registerTargets(asg.getRegion(), tgArn, List.of(td));
+                LOG.debugv("ASG {0}: registered {1} with TG {2}",
+                        asg.getAutoScalingGroupName(), instanceId, tgArn);
+            } catch (Exception e) {
+                LOG.warnv(e, "ASG {0}: could not register {1} with TG {2}: {3}",
+                        asg.getAutoScalingGroupName(), instanceId, tgArn, e.getMessage());
+                if (strict && !(e instanceof AwsException aws
+                        && "TargetGroupNotFound".equals(aws.getErrorCode()))) {
+                    throw e;
+                }
+            }
+        }
+    }
+
     static void deregisterFromTargetGroups(ElbV2Service elb, AutoScalingGroup asg, List<String> instanceIds) {
+        deregisterFromTargetGroups(elb, asg, asg.getTargetGroupARNs(), instanceIds);
+    }
+
+    /** As above, from {@code targetGroupArns} rather than from every target group the group has attached. */
+    static void deregisterFromTargetGroups(ElbV2Service elb, AutoScalingGroup asg, Collection<String> targetGroupArns,
+                                           List<String> instanceIds) {
         List<TargetDescription> targets = instanceIds.stream().map(id -> {
             TargetDescription target = new TargetDescription();
             target.setId(id);
             return target;
         }).toList();
-        for (String targetGroup : asg.getTargetGroupARNs()) {
+        for (String targetGroup : targetGroupArns) {
             try {
                 elb.deregisterTargets(asg.getRegion(), targetGroup, targets);
             } catch (AwsException e) {
