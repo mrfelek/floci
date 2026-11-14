@@ -74,6 +74,8 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.BiPredicate;
 import java.util.function.Consumer;
+import java.util.function.Function;
+import java.util.function.Predicate;
 import java.util.function.Supplier;
 import java.util.regex.Pattern;
 
@@ -346,6 +348,7 @@ public class RedshiftService implements ManagedSecretRotator {
     void onStart(@Observes StartupEvent event) {
         List<AccountAwareStorageBackend.AccountEntry<Cluster>> persistedClusters =
                 clusters.scanAllAccountEntries(k -> true);
+        migrateLegacyRegionalRecords(persistedClusters);
         for (AccountAwareStorageBackend.AccountEntry<Cluster> entry : persistedClusters) {
             if (entry.value().getProxyPort() > 0) {
                 usedPorts.add(entry.value().getProxyPort());
@@ -716,6 +719,7 @@ public class RedshiftService implements ManagedSecretRotator {
         }
 
         boolean nameTaken = integrations.scan(k -> true).stream()
+                .filter(existing -> region.equals(integrationRegion(existing)))
                 .anyMatch(existing -> integrationName.equals(existing.getIntegrationName()));
         if (nameTaken) {
             throw new AwsException("IntegrationAlreadyExistsFault",
@@ -827,6 +831,7 @@ public class RedshiftService implements ManagedSecretRotator {
     public IntegrationPage describeIntegrations(String integrationArn, Integer maxRecords, String marker,
                                                 List<IntegrationFilter> filters) {
         List<Integration> all = integrations.scan(k -> true).stream()
+                .filter(this::isInRequestRegion)
                 .sorted(Comparator.comparing(Integration::getIntegrationArn))
                 .toList();
 
@@ -1065,6 +1070,7 @@ public class RedshiftService implements ManagedSecretRotator {
         }
         if (autoCopyConsumer != null) {
             integrations.keys().stream().map(integrations::get).flatMap(Optional::stream)
+                    .filter(this::isInRequestRegion)
                     .filter(integration -> integrationArn.equals(integration.getIntegrationArn())
                             && S3_EVENT_SOURCE_TYPE.equals(integration.getSourceType()))
                     .findFirst().ifPresent(autoCopyConsumer::disable);
@@ -1080,7 +1086,8 @@ public class RedshiftService implements ManagedSecretRotator {
         }
         for (String key : integrations.keys()) {
             Optional<Integration> stored = integrations.get(key);
-            if (stored.isPresent() && integrationArn.equals(stored.get().getIntegrationArn())) {
+            if (stored.isPresent() && integrationArn.equals(stored.get().getIntegrationArn())
+                    && isInRequestRegion(stored.get())) {
                 integrations.delete(key);
                 LOG.infov("Deleted Redshift zero-ETL integration: {0}", integrationArn);
                 if (stored.get().getSourceType() == null) {
@@ -2006,7 +2013,7 @@ public class RedshiftService implements ManagedSecretRotator {
         validateSnapshotIdentifier(snapshotIdentifier);
         String clusterIdentifier = cluster.getClusterIdentifier();
         boolean shadowedByCopy = scheduledTime == null
-                && snapshotCopies.get(copyKey(regionResolver.getRegion(), snapshotIdentifier)).isPresent();
+                && snapshotCopies.get(regionalKey(snapshotIdentifier)).isPresent();
         if (shadowedByCopy || (scheduledTime == null ? snapshots.get(snapshotIdentifier)
                 : snapshots.getForAccount(accountId, snapshotIdentifier)).isPresent()) {
             throw new AwsException("ClusterSnapshotAlreadyExists", "Snapshot " + snapshotIdentifier + " already exists", 400);
@@ -2115,8 +2122,77 @@ public class RedshiftService implements ManagedSecretRotator {
         return visible;
     }
 
-    private static String copyKey(String region, String snapshotIdentifier) {
-        return region + "::" + snapshotIdentifier;
+    /**
+     * The storage key of the Regional record {@code name} in {@code region}: a snapshot copy, cluster parameter
+     * group, subnet group, snapshot copy grant or snapshot schedule. Each is Regional, so the same name can be
+     * used in each Region of an account.
+     */
+    private static String regionalKey(String region, String name) {
+        return region + "::" + name;
+    }
+
+    /**
+     * Moves the cluster parameter groups, subnet groups, snapshot schedules and snapshot copy grants stored before
+     * they became Regional from their bare name onto {@link #regionalKey} keys. They recorded no Region, and every
+     * Region saw them: each moves to the default Region, and is copied to every other Region where one of its
+     * account's clusters uses it, so those clusters keep finding it.
+     */
+    private void migrateLegacyRegionalRecords(List<AccountAwareStorageBackend.AccountEntry<Cluster>> persistedClusters) {
+        migrateLegacyRegionalRecords(parameterGroups, ClusterParameterGroup::getParameterGroupName, persistedClusters,
+                Cluster::getClusterParameterGroupName, this::snapshotRegion);
+        migrateLegacyRegionalRecords(subnetGroups, ClusterSubnetGroup::getClusterSubnetGroupName, persistedClusters,
+                Cluster::getClusterSubnetGroupName, this::snapshotRegion);
+        migrateLegacyRegionalRecords(snapshotSchedules, SnapshotSchedule::getScheduleIdentifier, persistedClusters,
+                Cluster::getSnapshotScheduleIdentifier, this::snapshotRegion);
+        migrateLegacyRegionalRecords(snapshotCopyGrants, SnapshotCopyGrant::getSnapshotCopyGrantName, persistedClusters,
+                Cluster::getSnapshotCopyGrantName, Cluster::getSnapshotCopyDestinationRegion);
+    }
+
+    /**
+     * Moves {@code store}'s records without a Region in their key: the clusters that use one name it through
+     * {@code nameUsed}, in the Region {@code regionOfUse} gives.
+     */
+    private <V> void migrateLegacyRegionalRecords(AccountAwareStorageBackend<V> store, Function<V, String> name,
+                                                  List<AccountAwareStorageBackend.AccountEntry<Cluster>> persistedClusters,
+                                                  Function<Cluster, String> nameUsed,
+                                                  Function<Cluster, String> regionOfUse) {
+        Predicate<String> legacy = key -> !key.contains("::");
+        List<AccountAwareStorageBackend.AccountEntry<V>> entries = store.scanAllAccountEntries(legacy);
+        if (entries.isEmpty()) {
+            return;
+        }
+        String defaultRegion = regionResolver.getDefaultRegion();
+        Set<String> accounts = new LinkedHashSet<>();
+        for (AccountAwareStorageBackend.AccountEntry<V> entry : entries) {
+            accounts.add(entry.accountId());
+            String recordName = name.apply(entry.value());
+            for (AccountAwareStorageBackend.AccountEntry<Cluster> cluster : persistedClusters) {
+                String region = regionOfUse.apply(cluster.value());
+                if (recordName == null || region == null || region.equals(defaultRegion)
+                        || !cluster.accountId().equals(entry.accountId())
+                        || !recordName.equals(nameUsed.apply(cluster.value()))) {
+                    continue;
+                }
+                if (store.getForAccount(entry.accountId(), regionalKey(region, recordName)).isEmpty()) {
+                    store.putForAccount(entry.accountId(), regionalKey(region, recordName), entry.value());
+                }
+            }
+        }
+        for (String accountId : accounts) {
+            store.migrateLegacyEntries(accountId, legacy,
+                    value -> name.apply(value) == null ? null : regionalKey(defaultRegion, name.apply(value)),
+                    value -> true);
+        }
+        store.flush();
+    }
+
+    /** {@link #regionalKey(String, String)} in the request's Region. */
+    private String regionalKey(String name) {
+        return regionalKey(regionResolver.getRegion(), name);
+    }
+
+    private boolean isRequestRegionKey(String key) {
+        return key.startsWith(regionResolver.getRegion() + "::");
     }
 
     private List<Snapshot> copiesInRegion(String region) {
@@ -2125,7 +2201,7 @@ public class RedshiftService implements ManagedSecretRotator {
 
     /** The copy in this request's Region if there is one, otherwise the snapshot itself. */
     private Optional<Snapshot> findSnapshot(String snapshotIdentifier) {
-        return snapshotCopies.get(copyKey(regionResolver.getRegion(), snapshotIdentifier))
+        return snapshotCopies.get(regionalKey(snapshotIdentifier))
                 .or(() -> snapshots.get(snapshotIdentifier));
     }
 
@@ -2172,6 +2248,15 @@ public class RedshiftService implements ManagedSecretRotator {
 
     private boolean isInRequestRegion(Cluster cluster) {
         return snapshotRegion(cluster).equals(regionResolver.getRegion());
+    }
+
+    private boolean isInRequestRegion(Integration integration) {
+        return integrationRegion(integration).equals(regionResolver.getRegion());
+    }
+
+    /** The Region an integration was created in, which its ARN names. */
+    private String integrationRegion(Integration integration) {
+        return AwsArnUtils.regionOrDefault(integration.getIntegrationArn(), regionResolver.getDefaultRegion());
     }
 
     /**
@@ -2236,7 +2321,7 @@ public class RedshiftService implements ManagedSecretRotator {
     }
 
     private Snapshot shareableSnapshot(String snapshotIdentifier, String snapshotClusterIdentifier) {
-        String copyKey = copyKey(regionResolver.getRegion(), snapshotIdentifier);
+        String copyKey = regionalKey(snapshotIdentifier);
         if (snapshotCopies.get(copyKey).isPresent()) {
             throw new AwsException("InvalidClusterSnapshotState",
                     "Snapshot " + snapshotIdentifier + " is not an available manual snapshot, which is the only kind"
@@ -2312,7 +2397,7 @@ public class RedshiftService implements ManagedSecretRotator {
             }
 
             snapshot.setManualSnapshotRetentionPeriod(manualSnapshotRetentionPeriod);
-            String copyKey = copyKey(region, snapshotIdentifier);
+            String copyKey = regionalKey(region, snapshotIdentifier);
             if (snapshotCopies.get(copyKey).isPresent()) {
                 snapshotCopies.putAllAtomically(Map.of(copyKey, snapshot));
                 snapshotCopies.flush();
@@ -2335,7 +2420,7 @@ public class RedshiftService implements ManagedSecretRotator {
         String region = regionResolver.getRegion();
 
         return withResourceLock("snapshot", targetSnapshotIdentifier, () -> {
-            boolean shadowedByCopy = snapshotCopies.get(copyKey(region, targetSnapshotIdentifier)).isPresent();
+            boolean shadowedByCopy = snapshotCopies.get(regionalKey(region, targetSnapshotIdentifier)).isPresent();
             if (shadowedByCopy || snapshots.get(targetSnapshotIdentifier).isPresent()) {
                 throw new AwsException("ClusterSnapshotAlreadyExists",
                         "Snapshot " + targetSnapshotIdentifier + " already exists", 400);
@@ -2419,7 +2504,7 @@ public class RedshiftService implements ManagedSecretRotator {
     }
 
     private Snapshot removeSnapshot(String snapshotIdentifier, String snapshotClusterIdentifier) {
-        String copyKey = copyKey(regionResolver.getRegion(), snapshotIdentifier);
+        String copyKey = regionalKey(snapshotIdentifier);
         Optional<Snapshot> copyOpt = snapshotCopies.get(copyKey);
         Optional<Snapshot> snapshotOpt = copyOpt.or(() -> snapshots.get(snapshotIdentifier))
                 .filter(found -> takenFrom(found, snapshotClusterIdentifier));
@@ -2645,7 +2730,7 @@ public class RedshiftService implements ManagedSecretRotator {
         if (DEFAULT_PARAMETER_GROUP_NAME.equals(parameterGroupName)) {
             throw new AwsException("InvalidParameterValue", "The default parameter group name is reserved.", 400);
         }
-        if (parameterGroups.get(parameterGroupName).isPresent()) {
+        if (parameterGroups.get(regionalKey(parameterGroupName)).isPresent()) {
             throw new AwsException("ClusterParameterGroupAlreadyExists", "Cluster parameter group " + parameterGroupName + " already exists", 400);
         }
 
@@ -2653,7 +2738,7 @@ public class RedshiftService implements ManagedSecretRotator {
         if (tags != null) {
             group.setTags(new LinkedHashMap<>(tags));
         }
-        parameterGroups.put(parameterGroupName, group);
+        parameterGroups.put(regionalKey(parameterGroupName), group);
         parameterGroups.flush();
         emitEvent(RedshiftEventCatalog.PARAMETER_GROUP_CREATED, parameterGroupName,
                 "Cluster parameter group '" + parameterGroupName + "' was created.");
@@ -2662,7 +2747,7 @@ public class RedshiftService implements ManagedSecretRotator {
 
     public List<ClusterParameterGroup> describeClusterParameterGroups(String parameterGroupName) {
         if (parameterGroupName != null && !parameterGroupName.isBlank()) {
-            Optional<ClusterParameterGroup> group = parameterGroups.get(parameterGroupName);
+            Optional<ClusterParameterGroup> group = parameterGroups.get(regionalKey(parameterGroupName));
             if (group.isEmpty() && DEFAULT_PARAMETER_GROUP_NAME.equals(parameterGroupName)) {
                 return List.of(defaultParameterGroup());
             }
@@ -2671,7 +2756,7 @@ public class RedshiftService implements ManagedSecretRotator {
             }
             return List.of(group.get());
         }
-        List<ClusterParameterGroup> all = new ArrayList<>(parameterGroups.scan(k -> true));
+        List<ClusterParameterGroup> all = new ArrayList<>(parameterGroups.scan(this::isRequestRegionKey));
         if (all.stream().noneMatch(g -> DEFAULT_PARAMETER_GROUP_NAME.equals(g.getParameterGroupName()))) {
             all.add(0, defaultParameterGroup());
         }
@@ -2685,11 +2770,11 @@ public class RedshiftService implements ManagedSecretRotator {
     }
 
     public Optional<ClusterParameterGroup> getClusterParameterGroup(String parameterGroupName) {
-        return parameterGroups.get(parameterGroupName);
+        return parameterGroups.get(regionalKey(parameterGroupName));
     }
 
     public List<Parameter> describeClusterParameters(String parameterGroupName) {
-        ClusterParameterGroup group = parameterGroups.get(parameterGroupName)
+        ClusterParameterGroup group = parameterGroups.get(regionalKey(parameterGroupName))
                 .or(() -> DEFAULT_PARAMETER_GROUP_NAME.equals(parameterGroupName)
                         ? Optional.of(defaultParameterGroup()) : Optional.empty())
                 .orElseThrow(() -> new AwsException("ClusterParameterGroupNotFound",
@@ -2700,7 +2785,7 @@ public class RedshiftService implements ManagedSecretRotator {
     public synchronized ClusterParameterGroup modifyClusterParameterGroup(
             String parameterGroupName, List<Parameter> updates) {
         requireMutableParameterGroup(parameterGroupName);
-        ClusterParameterGroup group = parameterGroups.get(parameterGroupName)
+        ClusterParameterGroup group = parameterGroups.get(regionalKey(parameterGroupName))
                 .orElseThrow(() -> new AwsException("ClusterParameterGroupNotFound",
                         "Cluster parameter group " + parameterGroupName + " not found", 404));
 
@@ -2731,7 +2816,7 @@ public class RedshiftService implements ManagedSecretRotator {
             }
         }
         group.setParameters(current);
-        parameterGroups.put(parameterGroupName, group);
+        parameterGroups.put(regionalKey(parameterGroupName), group);
         parameterGroups.flush();
         refreshClustersForActivityParameter(parameterGroupName, group);
         emitParameterGroupUpdated(parameterGroupName);
@@ -2744,7 +2829,7 @@ public class RedshiftService implements ManagedSecretRotator {
     }
 
     private boolean userActivityLoggingEnabled(String parameterGroupName) {
-        ClusterParameterGroup group = parameterGroups.get(parameterGroupName)
+        ClusterParameterGroup group = parameterGroups.get(regionalKey(parameterGroupName))
                 .or(() -> DEFAULT_PARAMETER_GROUP_NAME.equals(parameterGroupName)
                         ? Optional.of(defaultParameterGroup()) : Optional.empty())
                 .orElse(null);
@@ -2772,7 +2857,7 @@ public class RedshiftService implements ManagedSecretRotator {
         if (parameterNames.size() > MAX_RESET_PARAMETERS) {
             throw new AwsException("InvalidParameterValue", "A maximum of 20 parameters can be reset.", 400);
         }
-        ClusterParameterGroup group = parameterGroups.get(parameterGroupName)
+        ClusterParameterGroup group = parameterGroups.get(regionalKey(parameterGroupName))
                 .orElseThrow(() -> new AwsException("ClusterParameterGroupNotFound",
                         "Cluster parameter group " + parameterGroupName + " not found", 404));
         Set<String> names = new LinkedHashSet<>();
@@ -2797,7 +2882,7 @@ public class RedshiftService implements ManagedSecretRotator {
             }
         }
         group.setParameters(reset);
-        parameterGroups.put(parameterGroupName, group);
+        parameterGroups.put(regionalKey(parameterGroupName), group);
         parameterGroups.flush();
         refreshClustersForActivityParameter(parameterGroupName, group);
         emitParameterGroupUpdated(parameterGroupName);
@@ -2807,6 +2892,7 @@ public class RedshiftService implements ManagedSecretRotator {
         boolean enabled = userActivityLoggingEnabled(group);
         String accountId = clusters.accountId();
         List<Cluster> affected = clusters.scan(key -> true).stream()
+                .filter(this::isInRequestRegion)
                 .filter(cluster -> parameterGroupName.equals(cluster.getClusterParameterGroupName())).toList();
         for (Cluster cluster : affected) {
             cluster.setUserActivityLoggingEnabled(enabled);
@@ -2827,7 +2913,7 @@ public class RedshiftService implements ManagedSecretRotator {
         if (name == null || name.isBlank()) {
             throw new AwsException("InvalidParameterValue", "ParameterGroupName is required", 400);
         }
-        if (DEFAULT_PARAMETER_GROUP_NAME.equals(name) && parameterGroups.get(name).isEmpty()) {
+        if (DEFAULT_PARAMETER_GROUP_NAME.equals(name) && parameterGroups.get(regionalKey(name)).isEmpty()) {
             throw new AwsException("InvalidParameterValue", "The default parameter group cannot be modified.", 400);
         }
     }
@@ -2848,12 +2934,12 @@ public class RedshiftService implements ManagedSecretRotator {
     }
 
     public ClusterParameterGroup deleteClusterParameterGroup(String parameterGroupName) {
-        Optional<ClusterParameterGroup> groupOpt = parameterGroups.get(parameterGroupName);
+        Optional<ClusterParameterGroup> groupOpt = parameterGroups.get(regionalKey(parameterGroupName));
         if (groupOpt.isEmpty()) {
             throw new AwsException("ClusterParameterGroupNotFound", "Cluster parameter group " + parameterGroupName + " not found", 404);
         }
         ClusterParameterGroup group = groupOpt.get();
-        parameterGroups.delete(parameterGroupName);
+        parameterGroups.delete(regionalKey(parameterGroupName));
         parameterGroups.flush();
         emitEvent(RedshiftEventCatalog.PARAMETER_GROUP_DELETED, parameterGroupName,
                 "Cluster parameter group '" + parameterGroupName + "' was deleted at " + eventTime() + ".");
@@ -2880,7 +2966,7 @@ public class RedshiftService implements ManagedSecretRotator {
         return switch (sourceType) {
             case RedshiftEventCatalog.CLUSTER -> regionalCluster(sourceIdentifier).isPresent();
             case RedshiftEventCatalog.PARAMETER_GROUP -> DEFAULT_PARAMETER_GROUP_NAME.equals(sourceIdentifier)
-                    || parameterGroups.get(sourceIdentifier).isPresent();
+                    || parameterGroups.get(regionalKey(sourceIdentifier)).isPresent();
             case RedshiftEventCatalog.SNAPSHOT -> findSnapshot(sourceIdentifier).isPresent();
             default -> false;
         };
@@ -2944,7 +3030,7 @@ public class RedshiftService implements ManagedSecretRotator {
 
     public ClusterSubnetGroup createClusterSubnetGroup(String name, String description, String vpcId,
                                                        List<String> subnetIds, Map<String, String> tags) {
-        if (subnetGroups.get(name).isPresent()) {
+        if (subnetGroups.get(regionalKey(name)).isPresent()) {
             throw new AwsException("ClusterSubnetGroupAlreadyExists", "Cluster subnet group " + name + " already exists", 400);
         }
         ClusterSubnetGroup group = new ClusterSubnetGroup(name, description, vpcId, subnetIds);
@@ -2952,7 +3038,7 @@ public class RedshiftService implements ManagedSecretRotator {
             group.setTags(new LinkedHashMap<>(tags));
         }
         resolveSubnets(group);
-        subnetGroups.put(name, group);
+        subnetGroups.put(regionalKey(name), group);
         subnetGroups.flush();
         return group;
     }
@@ -2978,15 +3064,15 @@ public class RedshiftService implements ManagedSecretRotator {
     public List<ClusterSubnetGroup> describeClusterSubnetGroups(String name) {
         if (name != null && !name.isBlank()) {
             // The Terraform AWS provider matches this exact "...Fault" code to detect a missing group.
-            ClusterSubnetGroup group = subnetGroups.get(name)
+            ClusterSubnetGroup group = subnetGroups.get(regionalKey(name))
                     .orElseThrow(() -> new AwsException("ClusterSubnetGroupNotFoundFault", "Cluster subnet group " + name + " not found", 400));
             return List.of(group);
         }
-        return subnetGroups.scan(k -> true);
+        return subnetGroups.scan(this::isRequestRegionKey);
     }
 
     public synchronized ClusterSubnetGroup modifyClusterSubnetGroup(String name, String description, List<String> subnetIds) {
-        ClusterSubnetGroup group = subnetGroups.get(name)
+        ClusterSubnetGroup group = subnetGroups.get(regionalKey(name))
                 .orElseThrow(() -> new AwsException("ClusterSubnetGroupNotFoundFault", "Cluster subnet group " + name + " not found", 400));
         if (description != null) {
             group.setDescription(description);
@@ -2996,15 +3082,15 @@ public class RedshiftService implements ManagedSecretRotator {
             group.setVpcId(null);
             resolveSubnets(group);
         }
-        subnetGroups.put(name, group);
+        subnetGroups.put(regionalKey(name), group);
         subnetGroups.flush();
         return group;
     }
 
     public ClusterSubnetGroup deleteClusterSubnetGroup(String name) {
-        ClusterSubnetGroup group = subnetGroups.get(name)
+        ClusterSubnetGroup group = subnetGroups.get(regionalKey(name))
                 .orElseThrow(() -> new AwsException("ClusterSubnetGroupNotFoundFault", "Cluster subnet group " + name + " not found", 400));
-        subnetGroups.delete(name);
+        subnetGroups.delete(regionalKey(name));
         subnetGroups.flush();
         return group;
     }
@@ -3039,7 +3125,7 @@ public class RedshiftService implements ManagedSecretRotator {
     // or two concurrent creates of the same name both succeed and the second overwrites the first.
     public synchronized SnapshotCopyGrant createSnapshotCopyGrant(String name, String kmsKeyId, Map<String, String> tags) {
         validateSnapshotCopyGrantName(name);
-        if (snapshotCopyGrants.get(name).isPresent()) {
+        if (snapshotCopyGrants.get(regionalKey(name)).isPresent()) {
             throw new AwsException("SnapshotCopyGrantAlreadyExistsFault",
                     "Snapshot copy grant " + name + " already exists", 400);
         }
@@ -3048,7 +3134,7 @@ public class RedshiftService implements ManagedSecretRotator {
         if (tags != null && !tags.isEmpty()) {
             grant.setTags(new LinkedHashMap<>(tags));
         }
-        snapshotCopyGrants.put(name, grant);
+        snapshotCopyGrants.put(regionalKey(name), grant);
         snapshotCopyGrants.flush();
         return grant;
     }
@@ -3076,12 +3162,12 @@ public class RedshiftService implements ManagedSecretRotator {
 
         List<SnapshotCopyGrant> matching;
         if (name != null && !name.isBlank()) {
-            SnapshotCopyGrant grant = snapshotCopyGrants.get(name)
+            SnapshotCopyGrant grant = snapshotCopyGrants.get(regionalKey(name))
                     .orElseThrow(() -> new AwsException("SnapshotCopyGrantNotFoundFault",
                             "Snapshot copy grant " + name + " not found", 400));
             matching = List.of(grant);
         } else {
-            matching = snapshotCopyGrants.scan(k -> true);
+            matching = snapshotCopyGrants.scan(this::isRequestRegionKey);
         }
 
         return Pagination.paginate(matching, SnapshotCopyGrant::getSnapshotCopyGrantName,
@@ -3090,16 +3176,17 @@ public class RedshiftService implements ManagedSecretRotator {
     }
 
     public synchronized SnapshotCopyGrant deleteSnapshotCopyGrant(String name) {
-        SnapshotCopyGrant grant = snapshotCopyGrants.get(name)
+        SnapshotCopyGrant grant = snapshotCopyGrants.get(regionalKey(name))
                 .orElseThrow(() -> new AwsException("SnapshotCopyGrantNotFoundFault",
                         "Snapshot copy grant " + name + " not found", 400));
         boolean inUse = clusters.scan(k -> true).stream()
-                .anyMatch(c -> name.equals(c.getSnapshotCopyGrantName()));
+                .anyMatch(c -> name.equals(c.getSnapshotCopyGrantName())
+                        && regionResolver.getRegion().equals(c.getSnapshotCopyDestinationRegion()));
         if (inUse) {
             throw new AwsException("InvalidSnapshotCopyGrantStateFault",
                     "Snapshot copy grant " + name + " is used by one or more clusters", 400);
         }
-        snapshotCopyGrants.delete(name);
+        snapshotCopyGrants.delete(regionalKey(name));
         snapshotCopyGrants.flush();
         return grant;
     }
@@ -3162,7 +3249,7 @@ public class RedshiftService implements ManagedSecretRotator {
         validateAutomatedRetention(retention);
         validateManualRetention(manualRetention);
         boolean hasGrant = snapshotCopyGrantName != null && !snapshotCopyGrantName.isBlank();
-        if (hasGrant && snapshotCopyGrants.get(snapshotCopyGrantName).isEmpty()) {
+        if (hasGrant && snapshotCopyGrants.get(regionalKey(destinationRegion, snapshotCopyGrantName)).isEmpty()) {
             throw new AwsException("SnapshotCopyGrantNotFoundFault",
                     "Snapshot copy grant " + snapshotCopyGrantName + " not found", 400);
         }
@@ -3336,7 +3423,8 @@ public class RedshiftService implements ManagedSecretRotator {
             return;
         }
         SnapshotSchedule schedule = cluster.getSnapshotScheduleIdentifier() == null ? null
-                : snapshotSchedules.getForAccount(accountId, cluster.getSnapshotScheduleIdentifier()).orElseThrow(
+                : snapshotSchedules.getForAccount(accountId,
+                        regionalKey(snapshotRegion(cluster), cluster.getSnapshotScheduleIdentifier())).orElseThrow(
                         () -> new AwsException("SnapshotScheduleNotFound", "The cluster's snapshot schedule is missing", 400));
         List<String> definitions = schedule == null ? List.of("rate(8 hours)")
                 : List.copyOf(schedule.getScheduleDefinitions());
@@ -3495,7 +3583,7 @@ public class RedshiftService implements ManagedSecretRotator {
                     || source.getSnapshotCreateTime().isBefore(current.getSnapshotCopyEnabledAt())) {
                 return null;
             }
-            String key = copyKey(destination, snapshotId);
+            String key = regionalKey(destination, snapshotId);
             Snapshot existing = snapshotCopies.getForAccount(accountId, key).orElse(null);
             if (existing != null) {
                 if (Objects.equals(source.getSnapshotCreateTime(), existing.getSourceSnapshotCreateTime())) {
@@ -3565,7 +3653,8 @@ public class RedshiftService implements ManagedSecretRotator {
         copy.setTags(new LinkedHashMap<>());
         copy.setAccountsWithRestoreAccess(new LinkedHashSet<>());
         copy.setKmsKeyId(Optional.ofNullable(cluster.getSnapshotCopyGrantName())
-                .flatMap(name -> snapshotCopyGrants.getForAccount(accountId, name))
+                .flatMap(name -> snapshotCopyGrants.getForAccount(accountId,
+                        regionalKey(cluster.getSnapshotCopyDestinationRegion(), name)))
                 .map(SnapshotCopyGrant::getKmsKeyId).orElse(null));
         if ("automated".equals(source.getSnapshotType())) {
             copy.setAutomatedSnapshotRetentionPeriod(cluster.getSnapshotCopyRetentionPeriod());
@@ -3677,7 +3766,7 @@ public class RedshiftService implements ManagedSecretRotator {
     }
 
     private SnapshotSchedule requireSnapshotSchedule(String scheduleIdentifier) {
-        return snapshotSchedules.get(scheduleIdentifier)
+        return snapshotSchedules.get(regionalKey(scheduleIdentifier))
                 .orElseThrow(() -> new AwsException("SnapshotScheduleNotFound",
                         "Snapshot schedule " + scheduleIdentifier + " not found", 400));
     }
@@ -3691,7 +3780,7 @@ public class RedshiftService implements ManagedSecretRotator {
             throw new AwsException("InvalidParameterValue",
                     "ScheduleIdentifier may contain only letters, digits and hyphens: " + id, 400);
         }
-        if (snapshotSchedules.get(id).isPresent()) {
+        if (snapshotSchedules.get(regionalKey(id)).isPresent()) {
             throw new AwsException("SnapshotScheduleAlreadyExists", "Snapshot schedule " + id + " already exists", 400);
         }
         validateScheduleDefinitions(definitions);
@@ -3700,7 +3789,7 @@ public class RedshiftService implements ManagedSecretRotator {
         if (tags != null && !tags.isEmpty()) {
             schedule.setTags(new LinkedHashMap<>(tags));
         }
-        snapshotSchedules.put(id, schedule);
+        snapshotSchedules.put(regionalKey(id), schedule);
         snapshotSchedules.flush();
         return schedule;
     }
@@ -3721,7 +3810,7 @@ public class RedshiftService implements ManagedSecretRotator {
             }
         }
         String byCluster = clusterSchedule;
-        List<SnapshotSchedule> matching = snapshotSchedules.scan(k -> true).stream()
+        List<SnapshotSchedule> matching = snapshotSchedules.scan(this::isRequestRegionKey).stream()
                 .filter(s -> scheduleIdentifier == null || scheduleIdentifier.isBlank()
                         || scheduleIdentifier.equals(s.getScheduleIdentifier()))
                 .filter(s -> byCluster == null || byCluster.equals(s.getScheduleIdentifier()))
@@ -3737,6 +3826,7 @@ public class RedshiftService implements ManagedSecretRotator {
     /** Identifiers of the clusters currently using the schedule, sorted for a stable response. */
     public List<String> clustersUsingSnapshotSchedule(String scheduleIdentifier) {
         return clusters.scan(k -> true).stream()
+                .filter(this::isInRequestRegion)
                 .filter(c -> scheduleIdentifier.equals(c.getSnapshotScheduleIdentifier()))
                 .map(Cluster::getClusterIdentifier)
                 .sorted()
@@ -3749,7 +3839,7 @@ public class RedshiftService implements ManagedSecretRotator {
         SnapshotSchedule schedule = new SnapshotSchedule(scheduleIdentifier, current.getScheduleDescription(), definitions);
         schedule.setTags(new LinkedHashMap<>(current.getTags()));
         schedule.setUpdatedAt(Instant.now());
-        snapshotSchedules.put(scheduleIdentifier, schedule);
+        snapshotSchedules.put(regionalKey(scheduleIdentifier), schedule);
         snapshotSchedules.flush();
         return schedule;
     }
@@ -3760,7 +3850,7 @@ public class RedshiftService implements ManagedSecretRotator {
             throw new AwsException("InvalidClusterSnapshotScheduleState",
                     "Snapshot schedule " + scheduleIdentifier + " is associated with one or more clusters.", 400);
         }
-        snapshotSchedules.delete(scheduleIdentifier);
+        snapshotSchedules.delete(regionalKey(scheduleIdentifier));
         snapshotSchedules.flush();
     }
 
@@ -3839,7 +3929,7 @@ public class RedshiftService implements ManagedSecretRotator {
         }
         if (resourceType == null || "snapshot".equalsIgnoreCase(resourceType)) {
             for (Snapshot s : snapshots.scan(k -> true)) {
-                if (snapshotCopies.get(copyKey(regionResolver.getRegion(), s.getSnapshotIdentifier())).isPresent()) {
+                if (snapshotCopies.get(regionalKey(s.getSnapshotIdentifier())).isPresent()) {
                     continue;
                 }
                 addTaggedResources(result, snapshotArn(s.getClusterIdentifier(), s.getSnapshotIdentifier()),
@@ -3850,25 +3940,25 @@ public class RedshiftService implements ManagedSecretRotator {
             }
         }
         if (resourceType == null || "parametergroup".equalsIgnoreCase(resourceType)) {
-            for (ClusterParameterGroup g : parameterGroups.scan(k -> true)) {
+            for (ClusterParameterGroup g : parameterGroups.scan(this::isRequestRegionKey)) {
                 addTaggedResources(result, parameterGroupArn(g.getParameterGroupName()),
                         "parametergroup", g.getTags(), tagKeysFilter);
             }
         }
         if (resourceType == null || "subnetgroup".equalsIgnoreCase(resourceType)) {
-            for (ClusterSubnetGroup g : subnetGroups.scan(k -> true)) {
+            for (ClusterSubnetGroup g : subnetGroups.scan(this::isRequestRegionKey)) {
                 addTaggedResources(result, subnetGroupArn(g.getClusterSubnetGroupName()),
                         "subnetgroup", g.getTags(), tagKeysFilter);
             }
         }
         if (resourceType == null || "snapshotcopygrant".equalsIgnoreCase(resourceType)) {
-            for (SnapshotCopyGrant g : snapshotCopyGrants.scan(k -> true)) {
+            for (SnapshotCopyGrant g : snapshotCopyGrants.scan(this::isRequestRegionKey)) {
                 addTaggedResources(result, snapshotCopyGrantArn(g.getSnapshotCopyGrantName()),
                         "snapshotcopygrant", g.getTags(), tagKeysFilter);
             }
         }
         if (resourceType == null || "snapshotschedule".equalsIgnoreCase(resourceType)) {
-            for (SnapshotSchedule s : snapshotSchedules.scan(k -> true)) {
+            for (SnapshotSchedule s : snapshotSchedules.scan(this::isRequestRegionKey)) {
                 addTaggedResources(result, snapshotScheduleArn(s.getScheduleIdentifier()),
                         "snapshotschedule", s.getTags(), tagKeysFilter);
             }
@@ -4000,7 +4090,7 @@ public class RedshiftService implements ManagedSecretRotator {
             }
             case "snapshot" -> {
                 String snapshotId = id.contains("/") ? id.substring(id.lastIndexOf('/') + 1) : id;
-                String copyKey = copyKey(arn.region(), snapshotId);
+                String copyKey = regionalKey(arn.region(), snapshotId);
                 Snapshot copy = snapshotCopies.get(copyKey).orElse(null);
                 if (copy != null) {
                     yield new TagHandle(copy.getTags(), updated -> {
@@ -4018,20 +4108,20 @@ public class RedshiftService implements ManagedSecretRotator {
                 });
             }
             case "parametergroup" -> {
-                ClusterParameterGroup group = parameterGroups.get(id)
+                ClusterParameterGroup group = parameterGroups.get(regionalKey(id))
                         .orElseThrow(() -> new AwsException("ClusterParameterGroupNotFound", "Cluster parameter group " + id + " not found", 404));
                 yield new TagHandle(group.getTags(), updated -> {
                     group.setTags(updated);
-                    parameterGroups.put(id, group);
+                    parameterGroups.put(regionalKey(id), group);
                     parameterGroups.flush();
                 });
             }
             case "subnetgroup" -> {
-                ClusterSubnetGroup group = subnetGroups.get(id)
+                ClusterSubnetGroup group = subnetGroups.get(regionalKey(id))
                         .orElseThrow(() -> new AwsException("ClusterSubnetGroupNotFoundFault", "Cluster subnet group " + id + " not found", 400));
                 yield new TagHandle(group.getTags(), updated -> {
                     group.setTags(updated);
-                    subnetGroups.put(id, group);
+                    subnetGroups.put(regionalKey(id), group);
                     subnetGroups.flush();
                 });
             }
@@ -4044,21 +4134,21 @@ public class RedshiftService implements ManagedSecretRotator {
                 // ClusterParameterGroupNotFound are each modelled at 404. The grant fault is
                 // modelled at 400, so emitting it here would pair a code with a status the
                 // model never gives it.
-                SnapshotCopyGrant grant = snapshotCopyGrants.get(id)
+                SnapshotCopyGrant grant = snapshotCopyGrants.get(regionalKey(id))
                         .orElseThrow(() -> new AwsException("ResourceNotFoundFault", "Snapshot copy grant " + id + " not found", 404));
                 yield new TagHandle(grant.getTags(), updated -> {
                     grant.setTags(updated);
-                    snapshotCopyGrants.put(id, grant);
+                    snapshotCopyGrants.put(regionalKey(id), grant);
                     snapshotCopyGrants.flush();
                 });
             }
             case "snapshotschedule" -> {
                 // ResourceNotFoundFault for the same reason as snapshotcopygrant above.
-                SnapshotSchedule schedule = snapshotSchedules.get(id)
+                SnapshotSchedule schedule = snapshotSchedules.get(regionalKey(id))
                         .orElseThrow(() -> new AwsException("ResourceNotFoundFault", "Snapshot schedule " + id + " not found", 404));
                 yield new TagHandle(schedule.getTags(), updated -> {
                     schedule.setTags(updated);
-                    snapshotSchedules.put(id, schedule);
+                    snapshotSchedules.put(regionalKey(id), schedule);
                     snapshotSchedules.flush();
                 });
             }
