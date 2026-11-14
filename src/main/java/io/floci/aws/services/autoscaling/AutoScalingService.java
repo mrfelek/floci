@@ -904,10 +904,16 @@ public class AutoScalingService implements PassedRoleLookup {
             throw new AwsException("ValidationError",
                     "HealthStatus must be Healthy or Unhealthy.", 400);
         }
-        updateGroupOfInstance(region, instanceId, asg -> asg.getInstances().stream()
-                .filter(instance -> instanceId.equals(instance.getInstanceId()))
-                .findFirst()
-                .ifPresent(instance -> instance.setHealthStatus(healthStatus)));
+        updateGroupOfInstance(region, instanceId, asg -> {
+            // Auto Scaling replaces an unhealthy instance.
+            if ("Unhealthy".equals(healthStatus)) {
+                refuseForEksGroup(asg);
+            }
+            asg.getInstances().stream()
+                    .filter(instance -> instanceId.equals(instance.getInstanceId()))
+                    .findFirst()
+                    .ifPresent(instance -> instance.setHealthStatus(healthStatus));
+        });
     }
 
     /** Applies {@code update} to the group holding {@code instanceId}, under that group's lock. */
@@ -927,6 +933,19 @@ public class AutoScalingService implements PassedRoleLookup {
             }
             update.accept(asg);
             groups.put(key, asg);
+        }
+    }
+
+    /**
+     * Refuses an operation that would launch, terminate, replace or move an instance of {@code asg} when it is an
+     * EKS group: its instance is the cluster's node, which Floci runs once for all of the cluster's node groups,
+     * and which the reconciler never acts on. DetachInstances and changes to the group's settings stay allowed.
+     */
+    private static void refuseForEksGroup(AutoScalingGroup asg) {
+        if (asg.isEksManaged()) {
+            throw new AwsException("ValidationError", "Auto Scaling group '" + asg.getAutoScalingGroupName()
+                    + "' is managed by Amazon EKS for a node group. Its instance is the cluster's node,"
+                    + " which the cluster's node groups share.", 400);
         }
     }
 
@@ -963,6 +982,7 @@ public class AutoScalingService implements PassedRoleLookup {
         synchronized (lockFor(region)) {
             synchronized (lockFor(asgKey(region, name))) {
                 AutoScalingGroup asg = requireGroup(region, name);
+                refuseForEksGroup(asg);
                 // An instance belongs to one group at a time, so the whole batch fails before any tag changes.
                 List<String> conflicts = new ArrayList<>();
                 forEachGroupInRegion(region, group -> {
@@ -1140,6 +1160,7 @@ public class AutoScalingService implements PassedRoleLookup {
     public void terminateInstanceInAutoScalingGroup(String region, String instanceId,
                                                      boolean decrementDesiredCapacity) {
         updateGroupOfInstance(region, instanceId, asg -> {
+            refuseForEksGroup(asg);
             InstanceRefresh refresh = activeInstanceRefresh(asg);
             completeInstanceRefreshIfSettled(region, asg.getAutoScalingGroupName(), asg);
             releaseRefreshOwnership(refresh, List.of(instanceId));
@@ -1166,6 +1187,7 @@ public class AutoScalingService implements PassedRoleLookup {
         String key = asgKey(region, name);
         synchronized (lockFor(key)) {
             AutoScalingGroup asg = requireGroup(region, name);
+            refuseForEksGroup(asg);
             List<AsgInstance> moving = membersInState(asg, instanceIds, "InService");
             int desired = asg.getDesiredCapacity();
             int newDesired = shouldDecrementDesiredCapacity ? desired - moving.size() : desired;
@@ -1200,6 +1222,7 @@ public class AutoScalingService implements PassedRoleLookup {
         String key = asgKey(region, name);
         synchronized (lockFor(key)) {
             AutoScalingGroup asg = requireGroup(region, name);
+            refuseForEksGroup(asg);
             List<AsgInstance> moving = membersInState(asg, instanceIds, "Standby");
             int desired = asg.getDesiredCapacity();
             int newDesired = desired + moving.size();
@@ -1304,6 +1327,7 @@ public class AutoScalingService implements PassedRoleLookup {
     public InstanceRefresh startInstanceRefresh(String region, String asgName, InstanceRefresh requestedRefresh) {
         synchronized (lockFor(asgKey(region, asgName))) {
             AutoScalingGroup asg = requireGroup(region, asgName);
+            refuseForEksGroup(asg);
             boolean activeRefresh = instanceRefreshes.values().stream()
                     .filter(r -> region.equals(r.getRegion()))
                     .filter(r -> asgName.equals(r.getAutoScalingGroupName()))

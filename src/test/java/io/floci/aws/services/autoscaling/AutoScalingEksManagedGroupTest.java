@@ -4,6 +4,7 @@ import io.floci.aws.core.common.AwsException;
 import io.floci.aws.core.common.RegionResolver;
 import io.floci.aws.services.autoscaling.model.AsgInstance;
 import io.floci.aws.services.autoscaling.model.AutoScalingGroup;
+import io.floci.aws.services.autoscaling.model.InstanceRefresh;
 import io.floci.aws.services.ec2.Ec2Service;
 import io.floci.aws.services.ec2.model.Instance;
 import io.floci.aws.services.ec2.model.Placement;
@@ -12,6 +13,7 @@ import io.floci.aws.services.elbv2.ElbV2Service;
 import io.floci.aws.services.elbv2.model.TargetDescription;
 import io.floci.aws.testing.ThreadStates;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.function.Executable;
 
 import java.util.List;
 import java.util.Map;
@@ -271,6 +273,46 @@ class AutoScalingEksManagedGroupTest {
         detaching.join(5000);
 
         assertEquals(Set.of(NODE), registered);
+    }
+
+    @Test
+    void operationsThatWouldMoveOrReplaceTheNodeAreRefusedAndTheRestAreNot() {
+        service.createEksManagedGroup(REGION, FIRST, 1, 3, 2, List.of(), tags("workers"));
+        service.addEksManagedInstance(REGION, FIRST, node());
+
+        assertRefused(() -> service.terminateInstanceInAutoScalingGroup(REGION, NODE, false));
+        assertRefused(() -> service.enterStandby(REGION, FIRST, List.of(NODE), false));
+        assertRefused(() -> service.exitStandby(REGION, FIRST, List.of(NODE)));
+        assertRefused(() -> service.startInstanceRefresh(REGION, FIRST, new InstanceRefresh()));
+        assertRefused(() -> service.setInstanceHealth(REGION, NODE, "Unhealthy", false));
+        assertRefused(() -> service.attachInstances(REGION, FIRST, List.of("i-0fedcba9876543210")));
+
+        AutoScalingGroup group = service.requireGroup(REGION, FIRST);
+        AsgInstance member = group.getInstances().getFirst();
+        assertEquals(List.of(NODE), memberIds(FIRST));
+        assertEquals("InService", member.getLifecycleState());
+        assertEquals("Healthy", member.getHealthStatus());
+        assertNull(member.getStandbyActivityId());
+        assertEquals(2, group.getDesiredCapacity());
+        assertEquals(List.of(), service.describeInstanceRefreshes(REGION, FIRST, null, null, null)
+                .instanceRefreshes());
+
+        // Changes that leave the node where it is stay allowed.
+        service.setInstanceHealth(REGION, NODE, "Healthy", false);
+        service.setDesiredCapacity(REGION, FIRST, 3);
+        service.setInstanceProtection(REGION, FIRST, List.of(NODE), true);
+
+        assertEquals(3, group.getDesiredCapacity());
+        assertTrue(member.isProtectedFromScaleIn());
+        verifyNoInteractions(targets, ec2);
+    }
+
+    private static void assertRefused(Executable operation) {
+        AwsException refused = assertThrows(AwsException.class, operation);
+        assertEquals("ValidationError", refused.getErrorCode());
+        assertEquals("Auto Scaling group '" + FIRST + "' is managed by Amazon EKS for a node group. Its instance is"
+                + " the cluster's node, which the cluster's node groups share.", refused.getMessage());
+        assertEquals(400, refused.getHttpStatus());
     }
 
     /** FIRST and SECOND, the groups of two node groups of one cluster, both holding its node. */
