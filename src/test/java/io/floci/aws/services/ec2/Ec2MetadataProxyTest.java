@@ -9,10 +9,12 @@ import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
 
+import java.io.File;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -40,8 +42,7 @@ class Ec2MetadataProxyTest {
         assertTrue(prelude.contains("2>/dev/null || true;"));
         for (String[] command : new String[][]{
                 Ec2MetadataProxy.installCommand(),
-                Ec2MetadataProxy.startCommand("10.0.0.1", 9169),
-                Ec2MetadataProxy.podIdentityStartCommand("10.0.0.1", 4566)}) {
+                Ec2MetadataProxy.startCommand("10.0.0.1", 9169)}) {
             assertTrue(command[2].startsWith("set -eu\n" + prelude + "\n"), command[2]);
         }
     }
@@ -117,21 +118,6 @@ class Ec2MetadataProxyTest {
         assertTrue(script.contains("-X PUT -H 'X-aws-ec2-metadata-token-ttl-seconds: 60'"));
         assertTrue(script.contains("http://169.254.169.254/latest/api/token"));
         assertTrue(script.contains("-H \"X-aws-ec2-metadata-token: $token\" http://169.254.169.254/latest/meta-data/instance-id"));
-    }
-
-    @Test
-    void podIdentityStartCommandAttachesAddressIdempotentlyAndTargetsHostAndPort() {
-        String[] command = Ec2MetadataProxy.podIdentityStartCommand("10.0.0.1", 4566);
-        assertEquals(3, command.length);
-        assertEquals("sh", command[0]);
-        assertEquals("-c", command[1]);
-
-        String script = command[2];
-        assertTrue(script.contains("ip addr show dev lo | grep -q '169.254.170.23/32' || ip addr add 169.254.170.23/32 dev lo"));
-        assertTrue(script.contains("if [ -f /tmp/floci-pod-identity-proxy.pid ] && pid=\"$(cat /tmp/floci-pod-identity-proxy.pid)\" && [ \"$(cat \"/proc/$pid/comm\" 2>/dev/null)\" = socat ]"
-                + " && tr '\\0' ' ' 2>/dev/null <\"/proc/$pid/cmdline\" | grep -q 'TCP-LISTEN:80,bind=169.254.170.23,'; then\n  exit 0\nfi"));
-        assertTrue(script.contains("nohup socat TCP-LISTEN:80,bind=169.254.170.23,fork,reuseaddr TCP:10.0.0.1:4566 >/tmp/floci-pod-identity-proxy.log 2>&1 &"));
-        assertTrue(script.contains("http://169.254.170.23/v1/credentials"));
     }
 
     @Test
@@ -241,9 +227,9 @@ class Ec2MetadataProxyTest {
     }
 
     /**
-     * The pod identity relay answers 400 without a pod token, which still proves socat relays. A
-     * proxy that answered in its place would look the same to the status check, so the probe
-     * must not go through one.
+     * Floci answers 400 without a pod token, which still proves the path reaches it. A proxy that
+     * answered in its place would look the same to the status check, so the probe must not go
+     * through one.
      */
     @Test
     void podIdentityProbeIgnoresTheImagesHttpProxy(@TempDir Path directory) throws Exception {
@@ -276,6 +262,63 @@ class Ec2MetadataProxyTest {
                 proxy.stop(0);
             }
         }
+    }
+
+    /**
+     * A stock {@code rancher/k3s} node has BusyBox's {@code wget} and no {@code curl}: without curl
+     * the probe asks with wget, reads the status from the error it prints, and does not go through
+     * the image's proxy either.
+     */
+    @Test
+    void podIdentityProbeUsesWgetWithoutCurl(@TempDir Path directory) throws Exception {
+        Optional<Path> wget = onPath("wget");
+        assumeTrue(wget.isPresent(), "wget is not installed on this host");
+        Path bin = Files.createDirectory(directory.resolve("bin"));
+        for (String tool : List.of("env", "grep")) {
+            Files.createSymbolicLink(bin.resolve(tool), onPath(tool).orElseThrow());
+        }
+        Files.createSymbolicLink(bin.resolve("wget"), wget.get());
+        List<String> proxied = new CopyOnWriteArrayList<>();
+        AtomicInteger answered = new AtomicInteger();
+        HttpServer proxy = null;
+        HttpServer floci = null;
+        try {
+            proxy = failingProxy(proxied);
+            floci = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+            floci.createContext("/v1/credentials", exchange -> {
+                answered.incrementAndGet();
+                exchange.sendResponseHeaders(400, -1);
+                exchange.close();
+            });
+            floci.start();
+            String[] probe = {"sh", "-c",
+                    Ec2MetadataProxy.podIdentityProbeCommand("http://127.0.0.1:" + floci.getAddress().getPort())};
+            Map<String, String> environment = new HashMap<>(proxyEnvironment(proxy));
+            environment.put("PATH", bin.toString());
+
+            int result = HelperShellFixture.run(probe, directory, environment);
+
+            assertEquals(0, result, HelperShellFixture.output(directory));
+            assertEquals(1, answered.get(), HelperShellFixture.output(directory));
+            assertEquals(List.of(), proxied);
+        } finally {
+            if (floci != null) {
+                floci.stop(0);
+            }
+            if (proxy != null) {
+                proxy.stop(0);
+            }
+        }
+    }
+
+    private static Optional<Path> onPath(String tool) {
+        for (String dir : System.getenv().getOrDefault("PATH", "").split(File.pathSeparator)) {
+            Path candidate = Path.of(dir, tool);
+            if (!dir.isEmpty() && Files.isExecutable(candidate)) {
+                return Optional.of(candidate.toAbsolutePath());
+            }
+        }
+        return Optional.empty();
     }
 
     /**
