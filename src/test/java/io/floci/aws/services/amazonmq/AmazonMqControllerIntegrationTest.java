@@ -1,9 +1,13 @@
 package io.floci.aws.services.amazonmq;
 
+import io.floci.aws.testing.PartitionCleanup;
 import io.quarkus.test.junit.QuarkusTest;
+import io.restassured.specification.RequestSpecification;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.RegisterExtension;
 
 import java.util.List;
+import java.util.concurrent.atomic.AtomicLong;
 
 import static io.floci.aws.testing.EnforcementFixtures.auth;
 import static io.restassured.RestAssured.given;
@@ -17,13 +21,28 @@ import static org.hamcrest.Matchers.startsWith;
 @QuarkusTest
 class AmazonMqControllerIntegrationTest {
 
+    private static final AtomicLong ACCOUNTS = new AtomicLong(731300000000L);
+
+    @RegisterExtension
+    final PartitionCleanup cleanup = new PartitionCleanup();
+
     private String createRabbitBroker(String name) {
-        return createRabbitBroker(name, "us-east-1");
+        return createRabbitBroker(given(), name);
     }
 
-    private String createRabbitBroker(String name, String region) {
-        return given()
-            .header("Authorization", auth("test", region, "mq"))
+    /** A broker created for {@code account} in {@code region}, deleted after the test unless the test did. */
+    private String createRabbitBroker(String account, String region, String name) {
+        String brokerId = createRabbitBroker(mq(account, region), name);
+        cleanup.register(() -> mq(account, region).when().delete("/v1/brokers/{id}", brokerId));
+        return brokerId;
+    }
+
+    private static RequestSpecification mq(String account, String region) {
+        return given().header("Authorization", auth(account, region, "mq"));
+    }
+
+    private static String createRabbitBroker(RequestSpecification request, String name) {
+        return request
             .contentType("application/json")
             .body("""
                 {"brokerName": "%s", "engineType": "RABBITMQ",
@@ -209,28 +228,52 @@ class AmazonMqControllerIntegrationTest {
             .statusCode(400);
     }
 
-    /** Brokers are Regional: another Region of the account neither lists, describes nor deletes one. */
+    /**
+     * Brokers are Regional: another Region of the account neither lists, describes, reboots nor deletes
+     * one, and its name can be used there. The test works in an account of its own, so each listing holds
+     * only its brokers.
+     */
     @Test
     void aBrokerIsSeenOnlyInTheRegionItWasCreatedIn() {
-        String brokerId = createRabbitBroker("it-regional", "eu-west-1");
+        String account = Long.toString(ACCOUNTS.incrementAndGet());
+        String inIreland = createRabbitBroker(account, "eu-west-1", "it-regional");
 
-        given().header("Authorization", auth("test", "us-east-1", "mq"))
-        .when().get("/v1/brokers")
-        .then().statusCode(200).body("brokerSummaries.brokerId", not(hasItem(brokerId)));
-        given().header("Authorization", auth("test", "us-east-1", "mq"))
-        .when().get("/v1/brokers/{id}", brokerId)
-        .then().statusCode(404);
-        given().header("Authorization", auth("test", "us-east-1", "mq"))
-        .when().delete("/v1/brokers/{id}", brokerId)
-        .then().statusCode(404);
-        // The name is the eu-west-1 broker's only there.
-        createRabbitBroker("it-regional", "us-east-1");
+        mq(account, "us-east-1")
+        .when()
+            .get("/v1/brokers")
+        .then()
+            .statusCode(200)
+            .body("brokerSummaries.brokerId", equalTo(List.of()));
+        mq(account, "us-east-1")
+        .when()
+            .get("/v1/brokers/{id}", inIreland)
+        .then()
+            .statusCode(404);
+        mq(account, "us-east-1")
+            .contentType("application/json")
+        .when()
+            .post("/v1/brokers/{id}/reboot", inIreland)
+        .then()
+            .statusCode(404);
+        mq(account, "us-east-1")
+        .when()
+            .delete("/v1/brokers/{id}", inIreland)
+        .then()
+            .statusCode(404);
 
-        given().header("Authorization", auth("test", "eu-west-1", "mq"))
-        .when().get("/v1/brokers")
-        .then().statusCode(200).body("brokerSummaries.brokerId", hasItem(brokerId));
-        given().header("Authorization", auth("test", "eu-west-1", "mq"))
-        .when().delete("/v1/brokers/{id}", brokerId)
-        .then().statusCode(200);
+        String inVirginia = createRabbitBroker(account, "us-east-1", "it-regional");
+
+        mq(account, "eu-west-1")
+        .when()
+            .get("/v1/brokers")
+        .then()
+            .statusCode(200)
+            .body("brokerSummaries.brokerId", equalTo(List.of(inIreland)));
+        mq(account, "us-east-1")
+        .when()
+            .get("/v1/brokers")
+        .then()
+            .statusCode(200)
+            .body("brokerSummaries.brokerId", equalTo(List.of(inVirginia)));
     }
 }
