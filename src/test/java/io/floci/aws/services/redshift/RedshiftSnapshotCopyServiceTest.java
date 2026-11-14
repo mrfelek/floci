@@ -211,9 +211,13 @@ class RedshiftSnapshotCopyServiceTest {
         fixture.service(SOURCE).createSnapshot("nightly", "warehouse");
         fixture.service(SOURCE).runSnapshotCopies(Instant.now());
         fixture.service(SOURCE).deleteSnapshot("nightly");
+        Cluster replica = seedCluster(fixture, "replica", null);
+        replica.setSnapshotRegion(DESTINATION);
+        replica.setSnapshotCopyDestinationRegion(null);
+        fixture.clusters().putForAccount(ACCOUNT, "replica", replica);
 
         AwsException refused = assertThrows(AwsException.class,
-                () -> fixture.service(DESTINATION).createSnapshot("nightly", "warehouse"));
+                () -> fixture.service(DESTINATION).createSnapshot("nightly", "replica"));
         assertEquals("ClusterSnapshotAlreadyExists", refused.getErrorCode());
     }
 
