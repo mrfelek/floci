@@ -1334,9 +1334,10 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
                             nodeGroup.setStatus(NodegroupStatus.ACTIVE);
                         }
                     }
+                    // The node group is already stored, so a node registering meanwhile finds it.
+                    createNodeGroupAutoScalingGroup(accountId, currentCluster, nodeGroup);
                     nodeGroupStorage.put(storageKey, nodeGroup);
                     stored = true;
-                    createNodeGroupAutoScalingGroup(accountId, currentCluster, nodeGroup);
                 }
             } finally {
                 if (ownsPendingFirst) {
@@ -1903,8 +1904,9 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
 
     /**
      * Creates the Auto Scaling group {@code nodeGroup} reports, in its account and Region, unless it exists, with
-     * the cluster's node in it once the node is registered. Floci runs one node per cluster, so every node group's
-     * group holds that node. The node is looked up after the group exists: a node registering meanwhile is added by
+     * the cluster's node in it once the node is registered, and records on the node group that it was created; the
+     * caller stores the node group. Floci runs one node per cluster, so every node group's group holds that node.
+     * The node is looked up after the group exists: a node registering meanwhile is added by
      * {@link #addNodeToNodeGroupAutoScalingGroups}, which finds the group, since the node group is stored first.
      */
     private void createNodeGroupAutoScalingGroup(String accountId, Cluster cluster, Nodegroup nodeGroup) {
@@ -1928,10 +1930,12 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
                     autoScaling.addEksManagedInstance(region, groupName, node);
                 }
             });
+            nodeGroup.setAutoScalingGroupCreated(true);
         } catch (RuntimeException e) {
-            // The node group stands without it, as it did before Floci kept these groups.
-            LOG.warnv("Could not create Auto Scaling group {0} of EKS node group {1}: {2}",
-                    groupName, nodeGroup.getNodegroupName(), e.getMessage());
+            // The node group stands without it, as it did before Floci kept these groups, and the next start
+            // tries again.
+            LOG.warnv("Could not create Auto Scaling group {0} of EKS node group {1} in cluster {2}: {3}",
+                    groupName, nodeGroup.getNodegroupName(), cluster.getName(), e.getMessage());
         }
     }
 
@@ -1949,37 +1953,67 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
             String region = resolveClusterRegion(cluster);
             for (Nodegroup nodeGroup : listNodeGroupsForCluster(clusterKey(cluster), entry.accountId())) {
                 String groupName = autoScalingGroupName(nodeGroup);
-                if (groupName != null) {
+                if (groupName == null) {
+                    continue;
+                }
+                try {
                     RequestScopes.runAs(entry.accountId(), region,
                             () -> autoScaling.addEksManagedInstance(region, groupName, node));
+                } catch (RuntimeException e) {
+                    LOG.warnv("Could not add the node of EKS cluster {0} to Auto Scaling group {1} of node group {2}: {3}",
+                            cluster.getName(), groupName, nodeGroup.getNodegroupName(), e.getMessage());
                 }
             }
         }
     }
 
     /**
-     * Gives the node groups stored before Floci kept their Auto Scaling groups the group each reports. A group that
-     * exists is left as it is, so this runs at every start.
+     * Gives each node group stored before Floci kept their Auto Scaling groups the group it reports, once: a node
+     * group whose group was created is skipped, so a group deleted through Auto Scaling stays deleted. Runs as this
+     * bean is created, from {@link #init()}.
      */
-    private void restoreNodeGroupAutoScalingGroups() {
+    void restoreNodeGroupAutoScalingGroups() {
         if (autoScaling == null) {
             return;
         }
         for (AccountAwareStorageBackend.AccountEntry<Cluster> entry : allClusterEntries()) {
-            for (Nodegroup nodeGroup : listNodeGroupsForCluster(clusterKey(entry.value()), entry.accountId())) {
-                createNodeGroupAutoScalingGroup(entry.accountId(), entry.value(), nodeGroup);
+            Cluster cluster = entry.value();
+            for (Nodegroup nodeGroup : listNodeGroupsForCluster(clusterKey(cluster), entry.accountId())) {
+                if (nodeGroup.isAutoScalingGroupCreated()) {
+                    continue;
+                }
+                createNodeGroupAutoScalingGroup(entry.accountId(), cluster, nodeGroup);
+                if (nodeGroup.isAutoScalingGroupCreated()) {
+                    putNodeGroupForAccount(entry.accountId(),
+                            nodeGroupKey(clusterKey(cluster), nodeGroup.getNodegroupName()), nodeGroup);
+                }
             }
         }
     }
 
+    private void putNodeGroupForAccount(String accountId, String key, Nodegroup nodeGroup) {
+        if (nodeGroupStorage instanceof AccountAwareStorageBackend<Nodegroup> aware) {
+            aware.putForAccount(accountId, key, nodeGroup);
+            return;
+        }
+        nodeGroupStorage.put(key, nodeGroup);
+    }
+
     /**
      * Deletes the Auto Scaling group {@code nodeGroup} reports, which takes the cluster's node out of its target
-     * groups, except those another node group's group has attached.
+     * groups, except those another node group's group has attached. A failure is logged, so the node group, and
+     * the other node groups of a cluster being deleted, are deleted all the same.
      */
     private void deleteNodeGroupAutoScalingGroup(String accountId, String region, Nodegroup nodeGroup) {
         String groupName = autoScalingGroupName(nodeGroup);
-        if (autoScaling != null && groupName != null) {
+        if (autoScaling == null || groupName == null) {
+            return;
+        }
+        try {
             RequestScopes.runAs(accountId, region, () -> autoScaling.deleteEksManagedGroup(region, groupName));
+        } catch (RuntimeException e) {
+            LOG.warnv("Could not delete Auto Scaling group {0} of EKS node group {1} in cluster {2}: {3}",
+                    groupName, nodeGroup.getNodegroupName(), nodeGroup.getClusterName(), e.getMessage());
         }
     }
 

@@ -2,7 +2,9 @@ package io.floci.aws.services.eks;
 
 import io.floci.aws.services.eks.model.Cluster;
 import io.floci.aws.testing.AlbFixtures;
+import io.floci.aws.testing.EnforcementFixtures;
 import io.floci.aws.testing.QueryRequests;
+import io.floci.aws.testing.TestAccounts;
 import io.quarkus.test.junit.QuarkusTest;
 import io.restassured.path.xml.XmlPath;
 import io.restassured.specification.RequestSpecification;
@@ -15,6 +17,8 @@ import java.util.Map;
 import java.util.UUID;
 
 import static io.restassured.RestAssured.given;
+import static org.hamcrest.Matchers.hasKey;
+import static org.hamcrest.Matchers.not;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 
 /**
@@ -26,7 +30,6 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 @QuarkusTest
 class EksNodegroupAutoScalingGroupIntegrationTest {
 
-    private static final String ACCOUNT = "271828182845";
     private static final String REGION = "us-east-1";
     private static final String SUBNET = "subnet-0123456789abcdef0";
     private static final String GROUP =
@@ -40,6 +43,8 @@ class EksNodegroupAutoScalingGroupIntegrationTest {
     @Inject
     EksClusterManager clusterManager;
 
+    private final String account = TestAccounts.randomId();
+
     @Test
     void attachingTheNodeGroupsAutoScalingGroupToATargetGroupRegistersTheClusterNode() {
         String suffix = UUID.randomUUID().toString().substring(0, 8);
@@ -47,20 +52,24 @@ class EksNodegroupAutoScalingGroupIntegrationTest {
         Cluster cluster = null;
         String targetGroupArn = null;
         try {
-            eks().body(Map.of("name", clusterName, "roleArn", "arn:aws:iam::" + ACCOUNT + ":role/cluster"))
+            eks().body(Map.of("name", clusterName, "roleArn", "arn:aws:iam::" + account + ":role/cluster"))
                     .post("/clusters").then().statusCode(200);
-            cluster = eksService.findAuthenticationCluster(ACCOUNT, REGION, clusterName).orElseThrow();
+            cluster = eksService.findAuthenticationCluster(account, REGION, clusterName).orElseThrow();
             // EKS runs in mock mode here, so the node is registered as the k3s container's start registers it.
             clusterManager.registerClusterNodeInstance(cluster, "mock-container-id");
             String nodeId = clusterManager.getRegisteredClusterNodeInstance(cluster).getInstanceId();
 
             String groupName = eks().body(Map.of(
                             "nodegroupName", "workers",
-                            "nodeRole", "arn:aws:iam::" + ACCOUNT + ":role/node",
+                            "nodeRole", "arn:aws:iam::" + account + ":role/node",
                             "subnets", List.of(SUBNET),
                             "scalingConfig", Map.of("minSize", 1, "maxSize", 3, "desiredSize", 2)))
                     .post("/clusters/" + clusterName + "/node-groups").then().statusCode(200)
+                    // Floci's record that it created the group is not part of the node group AWS describes.
+                    .body("nodegroup", not(hasKey("autoScalingGroupCreated")))
                     .extract().path("nodegroup.resources.autoScalingGroups[0].name");
+            eks().get("/clusters/" + clusterName + "/node-groups/workers").then().statusCode(200)
+                    .body("nodegroup", not(hasKey("autoScalingGroupCreated")));
 
             XmlPath described = describeGroup(groupName);
             assertEquals(List.of(groupName), described.getList(GROUP + ".AutoScalingGroupName", String.class));
@@ -77,7 +86,7 @@ class EksNodegroupAutoScalingGroupIntegrationTest {
                     "k8s.io/cluster-autoscaler/enabled", "true",
                     "k8s.io/cluster-autoscaler/" + clusterName, "owned"), tags(described));
 
-            targetGroupArn = AlbFixtures.createTargetGroup(ACCOUNT, clusterName, "instance", 80);
+            targetGroupArn = AlbFixtures.createTargetGroup(account, clusterName, "instance", 80);
             query("autoscaling", "AttachLoadBalancerTargetGroups",
                     "AutoScalingGroupName", groupName, "TargetGroupARNs.member.1", targetGroupArn)
                     .post("/").then().statusCode(200);
@@ -91,25 +100,23 @@ class EksNodegroupAutoScalingGroupIntegrationTest {
         } finally {
             eks().delete("/clusters/" + clusterName + "/node-groups/workers");
             eks().delete("/clusters/" + clusterName);
-            AlbFixtures.deleteTargetGroup(ACCOUNT, targetGroupArn);
+            AlbFixtures.deleteTargetGroup(account, targetGroupArn);
             if (cluster != null) {
                 clusterManager.unregisterMetadataEndpoint(cluster);
             }
         }
     }
 
-    private static RequestSpecification eks() {
-        return given()
-                .header("Authorization", "AWS4-HMAC-SHA256 Credential=" + ACCOUNT + "/20261114/" + REGION
-                        + "/eks/aws4_request, SignedHeaders=host, Signature=abc")
+    private RequestSpecification eks() {
+        return given().header("Authorization", EnforcementFixtures.auth(account, REGION, "eks"))
                 .contentType("application/json");
     }
 
-    private static RequestSpecification query(String service, String action, String... params) {
-        return QueryRequests.request(ACCOUNT, REGION, service, action, params);
+    private RequestSpecification query(String service, String action, String... params) {
+        return QueryRequests.request(account, REGION, service, action, params);
     }
 
-    private static XmlPath describeGroup(String groupName) {
+    private XmlPath describeGroup(String groupName) {
         return query("autoscaling", "DescribeAutoScalingGroups", "AutoScalingGroupNames.member.1", groupName)
                 .post("/").then().statusCode(200).extract().xmlPath();
     }
@@ -126,7 +133,7 @@ class EksNodegroupAutoScalingGroupIntegrationTest {
         return tags;
     }
 
-    private static List<String> targetIds(String targetGroupArn) {
+    private List<String> targetIds(String targetGroupArn) {
         return query("elasticloadbalancing", "DescribeTargetHealth", "TargetGroupArn", targetGroupArn)
                 .post("/").then().statusCode(200).extract().xmlPath()
                 .getList(TARGETS + ".Target.Id", String.class);

@@ -85,6 +85,7 @@ import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.spy;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.verifyNoMoreInteractions;
 import static org.mockito.Mockito.when;
 
@@ -1309,6 +1310,9 @@ class EksServiceTest {
         listener.getValue().accept(instance("i-0fedcba9876543210"));
         verify(autoScaling, never()).addEksManagedInstance(any(), any(), any());
 
+        // A group that fails to take the node does not keep it from the other node groups' groups.
+        doThrow(new IllegalStateException("group storage write failed"))
+                .when(autoScaling).addEksManagedInstance("us-east-1", first, node);
         listener.getValue().accept(node);
 
         verify(autoScaling).addEksManagedInstance("us-east-1", first, node);
@@ -1338,18 +1342,79 @@ class EksServiceTest {
     }
 
     @Test
-    void nodeGroupsStoredBeforeTheirAutoScalingGroupsGetThemAtStartup(@TempDir Path directory) {
-        EksService before = persistentEksService(directory);
-        before.init();
-        before.createCluster(createTestClusterRequest("restored-asg"));
-        String groupName = reportedAutoScalingGroup(before.createNodeGroup("restored-asg", nodeGroupRequest("workers")));
+    void anAutoScalingGroupThatFailsToDeleteLeavesTheNodeGroupAndClusterDeletionsToFinish() {
         AutoScalingService autoScaling = mock(AutoScalingService.class);
+        EksService service = serviceWithAutoScaling(mock(EksClusterManager.class), autoScaling);
+        service.createCluster(createTestClusterRequest("asg-delete-failure"));
+        String first = reportedAutoScalingGroup(
+                service.createNodeGroup("asg-delete-failure", nodeGroupRequest("first")));
+        String second = reportedAutoScalingGroup(
+                service.createNodeGroup("asg-delete-failure", nodeGroupRequest("second")));
+        String third = reportedAutoScalingGroup(
+                service.createNodeGroup("asg-delete-failure", nodeGroupRequest("third")));
+        RuntimeException failure = new IllegalStateException("target group storage write failed");
+        doThrow(failure).when(autoScaling).deleteEksManagedGroup("us-east-1", first);
+        doThrow(failure).when(autoScaling).deleteEksManagedGroup("us-east-1", second);
 
-        persistentEksService(directory, ec2Service, autoScaling).init();
+        service.deleteNodeGroup("asg-delete-failure", "first");
 
-        verify(autoScaling).createEksManagedGroup("us-east-1", groupName, 1, 1, 1,
-                List.of("subnet-0e2907431c9988b72", "subnet-04ad87f71c6e5ab4d"),
-                nodeGroupAutoScalingTags("restored-asg", "workers"));
+        assertEquals(List.of("second", "third"), service.listNodeGroups("asg-delete-failure").stream().sorted().toList());
+
+        service.deleteCluster("asg-delete-failure");
+
+        verify(autoScaling).deleteEksManagedGroup("us-east-1", second);
+        verify(autoScaling).deleteEksManagedGroup("us-east-1", third);
+        assertThrows(AwsException.class, () -> service.describeCluster("asg-delete-failure"));
+    }
+
+    @Test
+    void aNodeGroupStoredBeforeTheseGroupsGetsItsGroupAtOneStartOnly(@TempDir Path directory) {
+        // A node group stored by a Floci that did not keep these groups.
+        EksService legacy = persistentEksService(directory);
+        legacy.init();
+        legacy.createCluster(createTestClusterRequest("backfill-once"));
+        String legacyGroup = reportedAutoScalingGroup(
+                legacy.createNodeGroup("backfill-once", nodeGroupRequest("legacy")));
+        AutoScalingService firstStart = mock(AutoScalingService.class);
+
+        EksService upgraded = persistentEksService(directory, ec2Service, null, firstStart);
+        upgraded.init();
+        String createdGroup = reportedAutoScalingGroup(
+                upgraded.createNodeGroup("backfill-once", nodeGroupRequest("created")));
+
+        List<String> subnets = List.of("subnet-0e2907431c9988b72", "subnet-04ad87f71c6e5ab4d");
+        verify(firstStart).createEksManagedGroup("us-east-1", legacyGroup, 1, 1, 1, subnets,
+                nodeGroupAutoScalingTags("backfill-once", "legacy"));
+        verify(firstStart).createEksManagedGroup("us-east-1", createdGroup, 1, 1, 1, subnets,
+                nodeGroupAutoScalingTags("backfill-once", "created"));
+
+        // Both groups were created, so a group deleted through Auto Scaling since is not created again.
+        AutoScalingService secondStart = mock(AutoScalingService.class);
+        persistentEksService(directory, ec2Service, null, secondStart).init();
+
+        verifyNoInteractions(secondStart);
+    }
+
+    @Test
+    void aRestartedNodeJoinsTheGroupItsNodeGroupAlreadyHas(@TempDir Path directory) {
+        EksService before = persistentEksService(directory, ec2Service, null, mock(AutoScalingService.class));
+        before.init();
+        before.createCluster(createTestClusterRequest("restarted-node"));
+        String groupName = reportedAutoScalingGroup(
+                before.createNodeGroup("restarted-node", nodeGroupRequest("workers")));
+        EksClusterManager clusterManager = mock(EksClusterManager.class);
+        AutoScalingService autoScaling = mock(AutoScalingService.class);
+        EksService after = persistentEksService(directory, null, clusterManager, autoScaling);
+
+        after.init();
+        @SuppressWarnings("unchecked")
+        ArgumentCaptor<Consumer<Instance>> listener = ArgumentCaptor.forClass(Consumer.class);
+        verify(clusterManager).addNodeRegistrationListener(listener.capture());
+        Instance node = instance("i-0123456789abcdef0");
+        when(clusterManager.getRegisteredClusterNodeInstance(any())).thenReturn(node);
+        listener.getValue().accept(node);
+
+        verify(autoScaling).addEksManagedInstance("us-east-1", groupName, node);
         verifyNoMoreInteractions(autoScaling);
     }
 
@@ -2909,10 +2974,11 @@ class EksServiceTest {
     }
 
     private EksService persistentEksService(Path directory, Ec2Service ec2) {
-        return persistentEksService(directory, ec2, null);
+        return persistentEksService(directory, ec2, null, null);
     }
 
-    private EksService persistentEksService(Path directory, Ec2Service ec2, AutoScalingService autoScaling) {
+    private EksService persistentEksService(Path directory, Ec2Service ec2, EksClusterManager clusterManager,
+                                            AutoScalingService autoScaling) {
         StorageFactory storageFactory = new StorageFactory(null, null) {
             @Override
             public <V> AccountAwareStorageBackend<V> create(String serviceName, String fileName,
@@ -2924,7 +2990,7 @@ class EksServiceTest {
             }
         };
         return new EksService(storageFactory, testConfig(true),
-                new RegionResolver("us-east-1", "000000000000"), null, ec2,
+                new RegionResolver("us-east-1", "000000000000"), clusterManager, ec2,
                 new EksOidcService(storageFactory, new ObjectMapper()), mock(EksAccessEntryService.class),
                 mock(EksPodIdentityAssociationService.class), null, autoScaling);
     }
