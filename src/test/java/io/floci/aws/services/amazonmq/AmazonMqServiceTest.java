@@ -185,7 +185,7 @@ class AmazonMqServiceTest {
         assertThrows(AwsException.class, () -> realModeService.rebootBroker(failed.getBrokerId()));
     }
 
-    /** Brokers are Regional: another Region of the account neither lists, describes nor deletes one. */
+    /** Brokers are Regional: another Region of the account neither lists, describes, reboots nor deletes one. */
     @Test
     void aBrokerIsSeenOnlyInItsOwnRegion() {
         String brokerId = service.createBroker(rabbitParams("orders")).getBrokerId();
@@ -194,6 +194,8 @@ class AmazonMqServiceTest {
         assertEquals(List.of(), service.listBrokers());
         assertEquals("NotFoundException",
                 assertThrows(AwsException.class, () -> service.describeBroker(brokerId)).getErrorCode());
+        assertEquals("NotFoundException",
+                assertThrows(AwsException.class, () -> service.rebootBroker(brokerId)).getErrorCode());
         assertEquals("NotFoundException",
                 assertThrows(AwsException.class, () -> service.deleteBroker(brokerId)).getErrorCode());
 
@@ -235,7 +237,10 @@ class AmazonMqServiceTest {
         assertEquals(List.of(), service.listBrokers());
     }
 
-    /** The readiness poller writes a broker back under the account that owns it and its own Region. */
+    /**
+     * The readiness poller writes a broker back under the account and the key it is stored under, even
+     * for a record that names no account, as one written before brokers carried theirs.
+     */
     @Test
     void aBrokerTurningReadyStaysInItsAccountAndRegion() {
         RabbitMqManager readyManager = Mockito.mock(RabbitMqManager.class);
@@ -243,7 +248,6 @@ class AmazonMqServiceTest {
         service = newService(false, readyManager);
         Broker starting = new Broker("b-starting", "arn:aws:mq:eu-west-1:111111111111:broker:starting:b-starting",
                 "starting", "RABBITMQ", "3.13", "SINGLE_INSTANCE", "mq.t3.micro");
-        starting.setAccountId("111111111111");
         starting.setBrokerState(BrokerState.CREATION_IN_PROGRESS);
         String key = AmazonMqService.brokerKey("eu-west-1", "b-starting");
         brokers.putForAccount("111111111111", key, starting);
