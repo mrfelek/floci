@@ -15,6 +15,7 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.BiFunction;
+import java.util.function.BiPredicate;
 import java.util.function.Function;
 import java.util.function.Predicate;
 import java.util.stream.Collectors;
@@ -241,6 +242,25 @@ public class AccountAwareStorageBackend<V> implements StorageBackend<String, V> 
             Predicate<V> legacyOwner) {
         migrateLegacyEntries(accountId, legacyKeyFilter,
                 (ignored, value) -> destinationKey.apply(value), legacyOwner);
+    }
+
+    /**
+     * {@link #migrateLegacyEntries(String, Predicate, Function, Predicate)} in every account that
+     * holds an entry here, an unprefixed entry counting as the default account's. For a store moving
+     * every record onto new keys at startup, when no request names an account.
+     */
+    public synchronized void migrateLegacyEntriesInEveryAccount(
+            Predicate<String> legacyKeyFilter,
+            Function<V, String> destinationKey,
+            BiPredicate<String, V> legacyOwner) {
+        Set<String> accounts = new LinkedHashSet<>();
+        for (String rawKey : delegate.keys()) {
+            accounts.add(hasAccountPrefix(rawKey) ? rawKey.substring(0, 12) : defaultAccountId);
+        }
+        for (String accountId : accounts) {
+            migrateLegacyEntries(accountId, legacyKeyFilter, destinationKey,
+                    value -> legacyOwner.test(accountId, value));
+        }
     }
 
     private synchronized void migrateLegacyEntries(
