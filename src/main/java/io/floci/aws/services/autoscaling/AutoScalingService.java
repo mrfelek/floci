@@ -411,9 +411,7 @@ public class AutoScalingService implements PassedRoleLookup {
 
         AutoScalingGroup asg = new AutoScalingGroup();
         asg.setAutoScalingGroupName(name);
-        asg.setAutoScalingGroupArn(
-                AwsArnUtils.Arn.of("autoscaling", region, regionResolver.getAccountId(),
-                        "autoScalingGroup:" + name).toString());
+        asg.setAutoScalingGroupArn(groupArn(region, name));
         asg.setLaunchConfigurationName(launchConfigName);
         asg.setLaunchTemplateId(launchTemplateId);
         asg.setLaunchTemplateName(launchTemplateName);
@@ -443,6 +441,11 @@ public class AutoScalingService implements PassedRoleLookup {
         }
         groups.put(key, asg);
         return asg;
+    }
+
+    private String groupArn(String region, String name) {
+        return AwsArnUtils.Arn.of("autoscaling", region, regionResolver.getAccountId(),
+                "autoScalingGroup:" + name).toString();
     }
 
     public void updateAutoScalingGroup(String region, String name,
@@ -1379,18 +1382,22 @@ public class AutoScalingService implements PassedRoleLookup {
 
     public void attachLoadBalancerTargetGroups(String region, String name, List<String> tgArns) {
         AutoScalingGroup asg = requireGroup(region, name);
+        Set<String> attachedBefore = attachedTargetGroups(asg);
         for (String arn : tgArns) {
             if (!asg.getTargetGroupARNs().contains(arn)) {
                 asg.getTargetGroupARNs().add(arn);
             }
         }
         groups.put(asgKey(region, name), asg);
+        registerEksMembers(asg, attachedBefore);
     }
 
     public void detachLoadBalancerTargetGroups(String region, String name, List<String> tgArns) {
         AutoScalingGroup asg = requireGroup(region, name);
+        Set<String> attachedBefore = attachedTargetGroups(asg);
         asg.getTargetGroupARNs().removeAll(tgArns);
         groups.put(asgKey(region, name), asg);
+        deregisterEksMembers(asg, attachedBefore);
     }
 
     public List<String> describeLoadBalancerTargetGroups(String region, String name) {
@@ -1425,19 +1432,23 @@ public class AutoScalingService implements PassedRoleLookup {
 
     public void attachTrafficSources(String region, String name, List<TrafficSourceIdentifier> sources) {
         AutoScalingGroup asg = requireGroup(region, name);
+        Set<String> attachedBefore = attachedTargetGroups(asg);
         for (TrafficSourceIdentifier source : sources) {
             asg.getTrafficSourceTypeByIdentifier().put(source.identifier(),
                     source.type() != null ? source.type() : "elbv2");
         }
         groups.put(asgKey(region, name), asg);
+        registerEksMembers(asg, attachedBefore);
     }
 
     public void detachTrafficSources(String region, String name, List<TrafficSourceIdentifier> sources) {
         AutoScalingGroup asg = requireGroup(region, name);
+        Set<String> attachedBefore = attachedTargetGroups(asg);
         for (TrafficSourceIdentifier source : sources) {
             asg.getTrafficSourceTypeByIdentifier().remove(source.identifier());
         }
         groups.put(asgKey(region, name), asg);
+        deregisterEksMembers(asg, attachedBefore);
     }
 
     public Map<String, String> describeTrafficSources(String region, String name, String trafficSourceType) {
@@ -1452,6 +1463,174 @@ public class AutoScalingService implements PassedRoleLookup {
             }
         });
         return filtered;
+    }
+
+    /** The target groups attached to {@code asg}: as target groups, and as {@code elbv2} traffic sources. */
+    private static Set<String> attachedTargetGroups(AutoScalingGroup asg) {
+        Set<String> attached = new LinkedHashSet<>(asg.getTargetGroupARNs());
+        asg.getTrafficSourceTypeByIdentifier().forEach((identifier, type) -> {
+            if ("elbv2".equals(type)) {
+                attached.add(identifier);
+            }
+        });
+        return attached;
+    }
+
+    // ── EKS managed node groups ────────────────────────────────────────────────
+    // EKS keeps a group for each managed node group, under the name DescribeNodegroup reports. Floci runs one node
+    // per cluster, which all of the cluster's node groups share, so their groups all hold that node, and the
+    // reconciler leaves them alone. The reconciler registers other groups' members with their target groups as
+    // they come into service; these groups' members are registered and deregistered here, as target groups are
+    // attached and detached.
+
+    /**
+     * Creates the group EKS keeps for a managed node group, unless a group of that name exists. It has no launch
+     * source: its instances are added with {@link #addEksManagedInstance}. Its zones are those of the subnets EC2
+     * knows, since CreateNodegroup does not check its subnets.
+     */
+    public void createEksManagedGroup(String region, String name, int minSize, int maxSize, int desiredCapacity,
+                                      List<String> subnetIds, Map<String, String> tags) {
+        String key = asgKey(region, name);
+        synchronized (lockFor(key)) {
+            if (groups.containsKey(key)) {
+                return;
+            }
+            AutoScalingGroup asg = new AutoScalingGroup();
+            asg.setAutoScalingGroupName(name);
+            asg.setAutoScalingGroupArn(groupArn(region, name));
+            asg.setMinSize(minSize);
+            asg.setMaxSize(maxSize);
+            asg.setDesiredCapacity(desiredCapacity);
+            List<String> zones = subnetIds.isEmpty() ? List.of()
+                    : ec2Service.describeSubnets(region, subnetIds, null).stream()
+                            .map(Subnet::getAvailabilityZone).distinct().toList();
+            asg.setAvailabilityZones(new ArrayList<>(zones));
+            asg.setSubnetIds(new ArrayList<>(subnetIds));
+            asg.setTerminationPolicies(List.of("Default"));
+            asg.setCreatedTime(Instant.now());
+            asg.setRegion(region);
+            asg.setEksManaged(true);
+            tags.forEach((tagKey, value) -> {
+                asg.getTags().put(tagKey, value);
+                asg.getTagPropagateAtLaunch().put(tagKey, true);
+            });
+            groups.put(key, asg);
+        }
+    }
+
+    /**
+     * Puts {@code instance} in service in the EKS group {@code name}, unless it is a member already, and registers
+     * it with the group's target groups. Does nothing when there is no EKS group of that name.
+     */
+    public void addEksManagedInstance(String region, String name, Instance instance) {
+        String key = asgKey(region, name);
+        synchronized (lockFor(key)) {
+            AutoScalingGroup asg = groups.get(key);
+            if (asg == null || !asg.isEksManaged() || containsInstance(asg, instance.getInstanceId())) {
+                return;
+            }
+            AsgInstance member = new AsgInstance();
+            member.setInstanceId(instance.getInstanceId());
+            member.setLifecycleState("InService");
+            member.setHealthStatus("Healthy");
+            member.setAvailabilityZone(instance.getPlacement() != null
+                    ? instance.getPlacement().getAvailabilityZone() : null);
+            member.setInstanceType(instance.getInstanceType());
+            asg.getInstances().add(member);
+            groups.put(key, asg);
+            registerWithTargetGroups(elbV2Service, asg, attachedTargetGroups(asg), member.getInstanceId(), false);
+        }
+    }
+
+    /**
+     * Deletes the EKS group {@code name}, if there is one, without terminating its instances, which EKS owns, and
+     * deregisters them from its target groups, except from a target group another group holding the same instance
+     * has attached.
+     */
+    public void deleteEksManagedGroup(String region, String name) {
+        String key = asgKey(region, name);
+        synchronized (lockFor(region)) {
+            synchronized (lockFor(key)) {
+                AutoScalingGroup asg = groups.get(key);
+                if (asg == null || !asg.isEksManaged()) {
+                    return;
+                }
+                deregisterFromUnsharedTargetGroups(asg, attachedTargetGroups(asg));
+                asg.getInstances().clear();
+                deleteAutoScalingGroup(region, name, false);
+            }
+        }
+    }
+
+    /**
+     * Registers the in-service members of the EKS group {@code asg} with the target groups attached to it since
+     * {@code attachedBefore}, as AWS registers a group's instances with a target group attached to it.
+     */
+    private void registerEksMembers(AutoScalingGroup asg, Set<String> attachedBefore) {
+        if (!asg.isEksManaged()) {
+            return;
+        }
+        Set<String> attached = attachedTargetGroups(asg);
+        attached.removeAll(attachedBefore);
+        if (attached.isEmpty()) {
+            return;
+        }
+        synchronized (lockFor(asgKey(asg.getRegion(), asg.getAutoScalingGroupName()))) {
+            for (AsgInstance member : asg.getInstances()) {
+                if ("InService".equals(member.getLifecycleState())) {
+                    registerWithTargetGroups(elbV2Service, asg, attached, member.getInstanceId(), false);
+                }
+            }
+        }
+    }
+
+    /**
+     * Deregisters the members of the EKS group {@code asg} from the target groups detached from it since
+     * {@code attachedBefore}, as AWS deregisters a group's instances from a target group detached from it, except
+     * from a target group another group holding the same instance has attached.
+     */
+    private void deregisterEksMembers(AutoScalingGroup asg, Set<String> attachedBefore) {
+        if (!asg.isEksManaged()) {
+            return;
+        }
+        Set<String> detached = new LinkedHashSet<>(attachedBefore);
+        detached.removeAll(attachedTargetGroups(asg));
+        if (detached.isEmpty()) {
+            return;
+        }
+        synchronized (lockFor(asg.getRegion())) {
+            synchronized (lockFor(asgKey(asg.getRegion(), asg.getAutoScalingGroupName()))) {
+                deregisterFromUnsharedTargetGroups(asg, detached);
+            }
+        }
+    }
+
+    /**
+     * Deregisters each member of {@code asg} from those of {@code targetGroupArns} that no other group holding it
+     * has attached: the groups of a cluster's node groups share its node. Called holding the Region's lock and the
+     * group's, so the other groups' members are read under their own locks as {@link #attachInstances} reads them.
+     */
+    private void deregisterFromUnsharedTargetGroups(AutoScalingGroup asg, Set<String> targetGroupArns) {
+        if (targetGroupArns.isEmpty()) {
+            return;
+        }
+        for (AsgInstance member : asg.getInstances()) {
+            Set<String> leaving = new LinkedHashSet<>(targetGroupArns);
+            for (AutoScalingGroup other : groups.values()) {
+                if (other == null || !asg.getRegion().equals(other.getRegion())
+                        || asg.getAutoScalingGroupName().equals(other.getAutoScalingGroupName())) {
+                    continue;
+                }
+                synchronized (lockFor(asgKey(other.getRegion(), other.getAutoScalingGroupName()))) {
+                    if (containsInstance(other, member.getInstanceId())) {
+                        leaving.removeAll(attachedTargetGroups(other));
+                    }
+                }
+            }
+            if (!leaving.isEmpty()) {
+                deregisterFromTargetGroups(elbV2Service, asg, leaving, List.of(member.getInstanceId()));
+            }
+        }
     }
 
     // ── Lifecycle hooks ────────────────────────────────────────────────────────

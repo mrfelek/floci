@@ -139,6 +139,11 @@ public class AutoScalingReconciler {
     }
 
     public void reconcile(AutoScalingGroup asg) {
+        // EKS owns the capacity of a managed node group's group. Its instance is the cluster's node, which
+        // Auto Scaling never launches, terminates or replaces.
+        if (asg.isEksManaged()) {
+            return;
+        }
         asgService.reconcileIfPresent(asg, () -> {
             settleStandbyMoves(asg);
             removeTerminatingInstances(asg);
