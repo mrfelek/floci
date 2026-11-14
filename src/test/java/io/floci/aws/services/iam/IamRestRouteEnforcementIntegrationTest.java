@@ -30,6 +30,7 @@ import static io.floci.aws.testing.EnforcementFixtures.auth;
 import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.equalTo;
+import static org.hamcrest.Matchers.hasItem;
 import static org.hamcrest.Matchers.not;
 
 /**
@@ -308,6 +309,19 @@ class IamRestRouteEnforcementIntegrationTest {
         refused(as(user, "eks").urlEncodingEnabled(false)
                 .delete(base + "/arn:aws:iam::" + ACCOUNT + ":role/ci/access-policies/runner").then(),
                 "eks:DeleteAccessEntry");
+    }
+
+    @Test
+    void listingEksAccessPoliciesIsCheckedAsItsOwnAction() {
+        // The access policies belong to no cluster, so ListAccessPolicies is granted on "*" and nothing narrower.
+        String user = user("route-eks-access-policies");
+
+        policy(user, allow("eks:ListAccessEntries", "*"));
+        refused(as(user, "eks").get("/access-policies").then(), "eks:ListAccessPolicies");
+
+        policy(user, allow("eks:ListAccessPolicies", "*"));
+        as(user, "eks").get("/access-policies").then().statusCode(200)
+                .body("accessPolicies.name", hasItem("AmazonEKSClusterAdminPolicy"));
     }
 
     @Test

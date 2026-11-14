@@ -1,12 +1,18 @@
 package io.floci.aws.services.eks;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
 import io.quarkus.test.junit.QuarkusTest;
+import io.restassured.response.ExtractableResponse;
+import io.restassured.response.Response;
+import io.restassured.specification.RequestSpecification;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
+import java.io.InputStream;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -14,6 +20,8 @@ import java.util.UUID;
 import static io.floci.aws.testing.IamTestPolicies.EMPTY_POLICY_DOCUMENT;
 import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.*;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 @QuarkusTest
 class EksAccessEntryIntegrationTest {
@@ -238,8 +246,59 @@ class EksAccessEntryIntegrationTest {
                 .body("cluster.accessConfig.bootstrapClusterCreatorAdminPermissions", equalTo(false));
     }
 
+    /**
+     * ListAccessPolicies lists the access policies the EKS documentation gives, in name order and a page at a time,
+     * each with its ARN in the caller's partition.
+     */
+    @Test
+    void listAccessPoliciesListsTheDocumentedPoliciesInTheCallersPartition() throws Exception {
+        List<String> documented = new ArrayList<>();
+        try (InputStream catalog = getClass().getResourceAsStream("/eks/access-policies.json")) {
+            new ObjectMapper().readTree(catalog).path("policies")
+                    .forEach(policy -> documented.add(policy.path("name").asText()));
+        }
+        String account = "135791357913";
+
+        List<String> listed = given().header("Authorization", auth(account, "eks")).get("/access-policies")
+                .then().statusCode(200).body("nextToken", nullValue())
+                .body("accessPolicies.find { it.name == 'AmazonEKSClusterAdminPolicy' }.arn",
+                        equalTo("arn:aws:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy"))
+                .extract().path("accessPolicies.name");
+        assertEquals(documented, listed);
+
+        List<String> paged = new ArrayList<>();
+        String token = null;
+        do {
+            RequestSpecification request = given().header("Authorization", auth(account, "eks"))
+                    .queryParam("maxResults", 10);
+            if (token != null) {
+                request = request.queryParam("nextToken", token);
+            }
+            ExtractableResponse<Response> page = request.get("/access-policies").then().statusCode(200).extract();
+            List<String> names = page.path("accessPolicies.name");
+            assertTrue(names.size() <= 10);
+            paged.addAll(names);
+            token = page.path("nextToken");
+        } while (token != null);
+        assertEquals(documented, paged);
+
+        for (String limit : List.of("0", "101")) {
+            given().header("Authorization", auth(account, "eks")).queryParam("maxResults", limit)
+                    .get("/access-policies").then().statusCode(400)
+                    .body("__type", equalTo("InvalidParameterException"));
+        }
+        given().header("Authorization", auth(account, "cn-north-1", "eks")).get("/access-policies")
+                .then().statusCode(200)
+                .body("accessPolicies.find { it.name == 'AmazonEKSViewPolicy' }.arn",
+                        equalTo("arn:aws-cn:eks::aws:cluster-access-policy/AmazonEKSViewPolicy"));
+    }
+
     private static String auth(String account, String service) {
+        return auth(account, "us-east-1", service);
+    }
+
+    private static String auth(String account, String region, String service) {
         return "AWS4-HMAC-SHA256 Credential=" + account
-                + "/20260916/us-east-1/" + service + "/aws4_request, SignedHeaders=host, Signature=abc";
+                + "/20260916/" + region + "/" + service + "/aws4_request, SignedHeaders=host, Signature=abc";
     }
 }

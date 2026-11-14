@@ -59,15 +59,17 @@ public class EksController {
     private final EksAccessEntryService accessEntries;
     private final EksPodIdentityAssociationService podIdentityAssociations;
     private final EksAddonService addons;
+    private final EksAccessPolicyCatalog accessPolicies;
 
     @Inject
     public EksController(EksService eksService, EksAccessEntryService accessEntries,
                          EksPodIdentityAssociationService podIdentityAssociations,
-                         EksAddonService addons) {
+                         EksAddonService addons, EksAccessPolicyCatalog accessPolicies) {
         this.eksService = eksService;
         this.accessEntries = accessEntries;
         this.podIdentityAssociations = podIdentityAssociations;
         this.addons = addons;
+        this.accessPolicies = accessPolicies;
     }
 
     @POST
@@ -227,6 +229,16 @@ public class EksController {
     public Response deleteAccessEntry(@PathParam("name") String name, @PathParam("principalArn") String principalArn) {
         accessEntries.delete(eksService.requireClusterInRequestRegion(name), principalArn);
         return Response.ok(Map.of()).build();
+    }
+
+    @GET
+    @Path("/access-policies")
+    public Response listAccessPolicies(@QueryParam("maxResults") String maxResults,
+                                       @QueryParam("nextToken") String nextToken) {
+        EksAccessPolicyCatalog.Page page = accessPolicies.list(
+                Pagination.parseMaxResults(maxResults, "InvalidParameterException"), nextToken);
+        return Response.ok(page.nextToken() == null ? Map.of("accessPolicies", page.accessPolicies())
+                : Map.of("accessPolicies", page.accessPolicies(), "nextToken", page.nextToken())).build();
     }
 
     @POST

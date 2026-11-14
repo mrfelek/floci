@@ -20,6 +20,7 @@ EKS uses a standard REST API with JSON bodies: not the JSON 1.1 (`X-Amz-Target`)
 | `AssociateAccessPolicy` | Associate an EKS access policy and its cluster or namespace scope with a STANDARD access entry |
 | `ListAssociatedAccessPolicies` | List the access policies associated with an access entry, with pagination |
 | `DisassociateAccessPolicy` | Remove an access policy from an access entry |
+| `ListAccessPolicies` | List the EKS access policies the EKS documentation gives, with pagination, each ARN in the caller's partition |
 | `CreatePodIdentityAssociation` | Create a pod identity association between a service account and IAM role |
 | `DescribePodIdentityAssociation` | Describe a pod identity association by association ID |
 | `ListPodIdentityAssociations` | List pod identity associations in a cluster with optional filtering and pagination |
@@ -73,7 +74,7 @@ rejects instance credentials. Obtain fresh IMDS credentials after upgrading so t
 includes the stable role ID.
 
 !!! note "Authentication scope"
-    Non-worker IAM users and ordinary STS sessions retain the existing cluster-admin compatibility behavior. STANDARD entries, access policies, aws-auth ConfigMap, the cluster-creator bootstrap flag and automatic managed-node entries are not enforced by this change. Updating authentication mode, UpdateAccessEntry, ListAccessPolicies, and entry tag updates remain unimplemented. Native AL2023 images, bootstrap RBAC/CSR approval, CNI and worker networking are separate requirements for registration and Ready.
+    Non-worker IAM users and ordinary STS sessions retain the existing cluster-admin compatibility behavior. STANDARD entries, access policies, aws-auth ConfigMap, the cluster-creator bootstrap flag and automatic managed-node entries are not enforced by this change. Updating authentication mode, UpdateAccessEntry, and entry tag updates remain unimplemented. Native AL2023 images, bootstrap RBAC/CSR approval, CNI and worker networking are separate requirements for registration and Ready.
 
 ```bash
 aws --endpoint-url http://localhost:4566 eks create-cluster \
