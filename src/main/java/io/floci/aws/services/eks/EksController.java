@@ -103,8 +103,7 @@ public class EksController {
                                  @QueryParam("nextToken") String nextToken) {
         PaginatedResult<String> page = eksService.listClusters(
                 Pagination.parseMaxResults(maxResults, "InvalidParameterException"), nextToken);
-        return Response.ok(page.nextToken() == null ? Map.of("clusters", page.items())
-                : Map.of("clusters", page.items(), "nextToken", page.nextToken())).build();
+        return listResponse("clusters", page.items(), page.nextToken());
     }
 
     @GET
@@ -234,8 +233,7 @@ public class EksController {
                                      @QueryParam("associatedPolicyArn") String associatedPolicyArn) {
         EksAccessEntryService.Page page = accessEntries.list(eksService.requireClusterInRequestRegion(name),
                 Pagination.parseMaxResults(maxResults, "InvalidParameterException"), nextToken, associatedPolicyArn);
-        return Response.ok(page.nextToken() == null ? Map.of("accessEntries", page.accessEntries())
-                : Map.of("accessEntries", page.accessEntries(), "nextToken", page.nextToken())).build();
+        return listResponse("accessEntries", page.accessEntries(), page.nextToken());
     }
 
     @GET
@@ -303,9 +301,7 @@ public class EksController {
         Cluster cluster = eksService.requireClusterInRequestRegion(name);
         EksAddonService.AddonNamesPage page = addons.list(cluster,
                 Pagination.parseMaxResults(maxResults, "InvalidParameterException"), nextToken);
-        return Response.ok(page.nextToken() == null
-                ? Map.of("addons", page.addons())
-                : Map.of("addons", page.addons(), "nextToken", page.nextToken())).build();
+        return listResponse("addons", page.addons(), page.nextToken());
     }
 
     @GET
@@ -366,9 +362,7 @@ public class EksController {
                 types,
                 owners
         );
-        return Response.ok(page.nextToken() == null
-                ? Map.of("addons", page.addons())
-                : Map.of("addons", page.addons(), "nextToken", page.nextToken())).build();
+        return listResponse("addons", page.addons(), page.nextToken());
     }
 
     @GET
@@ -397,9 +391,7 @@ public class EksController {
         Cluster cluster = eksService.requireClusterInRequestRegion(name);
         EksPodIdentityAssociationService.Page page = podIdentityAssociations.list(cluster, namespace, serviceAccount,
                 Pagination.parseMaxResults(maxResults, "InvalidParameterException"), nextToken);
-        return Response.ok(page.nextToken() == null
-                ? Map.of("associations", page.associations())
-                : Map.of("associations", page.associations(), "nextToken", page.nextToken())).build();
+        return listResponse("associations", page.associations(), page.nextToken());
     }
 
     @GET
@@ -428,5 +420,10 @@ public class EksController {
         Cluster cluster = eksService.requireClusterInRequestRegion(name);
         PodIdentityAssociation association = podIdentityAssociations.delete(cluster, associationId);
         return Response.ok(Map.of("association", association)).build();
+    }
+
+    /** A list call's answer: its items under {@code key}, and the next page's token when there is one. */
+    private static Response listResponse(String key, Object items, String nextToken) {
+        return Response.ok(nextToken == null ? Map.of(key, items) : Map.of(key, items, "nextToken", nextToken)).build();
     }
 }

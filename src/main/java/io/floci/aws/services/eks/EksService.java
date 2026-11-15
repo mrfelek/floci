@@ -5,7 +5,6 @@ import io.floci.aws.config.EmulatorConfig;
 import io.floci.aws.core.common.AwsArnUtils;
 import io.floci.aws.core.common.AwsException;
 import io.floci.aws.core.common.PaginatedResult;
-import io.floci.aws.core.common.Pagination;
 import io.floci.aws.core.common.RegionResolver;
 import io.floci.aws.core.common.RequestScopes;
 import io.floci.aws.core.common.ReservedTags;
@@ -1045,10 +1044,9 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
     }
 
     public PaginatedResult<String> listClusters(Integer maxResults, String nextToken) {
-        int limit = EksAccessEntryService.pageSize(maxResults);
         List<String> names = listClusters().stream().sorted().toList();
-        return Pagination.paginate(names, name -> name, limit, nextToken, "clusters:" + regionResolver.getAccountId() + ":" + regionResolver.getRegion(),
-                token -> new AwsException("InvalidParameterException", "Invalid nextToken", 400));
+        return EksAccessEntryService.page(names, name -> name, maxResults, nextToken,
+                "clusters:" + regionResolver.getAccountId() + ":" + regionResolver.getRegion());
     }
 
     /**

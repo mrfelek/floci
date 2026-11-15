@@ -32,6 +32,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.UUID;
+import java.util.function.Function;
 import java.util.function.UnaryOperator;
 
 /** Access-entry and access-policy management metadata; Kubernetes authorization is handled separately. */
@@ -100,9 +101,8 @@ public class EksAccessEntryService {
                                                       String nextToken) {
         List<AssociatedAccessPolicy> policies = storedEntry(cluster, principal).accessPolicies();
         // The newline ends the principal, so a token for role/a:b is not read as one for role/a.
-        PaginatedResult<AssociatedAccessPolicy> page = Pagination.paginate(policies, AssociatedAccessPolicy::policyArn,
-                pageSize(maxResults), nextToken, "policies:" + prefix(cluster) + principal + "\n",
-                token -> invalid("Invalid nextToken"));
+        PaginatedResult<AssociatedAccessPolicy> page = page(policies, AssociatedAccessPolicy::policyArn,
+                maxResults, nextToken, "policies:" + prefix(cluster) + principal + "\n");
         return new PolicyPage(page.items(), page.nextToken());
     }
 
@@ -261,8 +261,8 @@ public class EksAccessEntryService {
                 .filter(stored -> associatedPolicyArn == null || stored.accessPolicies().stream()
                         .anyMatch(policy -> policy.policyArn().equals(associatedPolicyArn)))
                 .map(stored -> stored.entry().principalArn()).toList();
-        PaginatedResult<String> page = Pagination.paginate(principals, principal -> principal, pageSize(maxResults),
-                nextToken, "entries:" + prefix, token -> invalid("Invalid nextToken"));
+        PaginatedResult<String> page = page(principals, principal -> principal, maxResults, nextToken,
+                "entries:" + prefix);
         return new Page(page.items(), page.nextToken());
     }
 
@@ -319,12 +319,25 @@ public class EksAccessEntryService {
         }
     }
 
-    static int pageSize(Integer maxResults) {
+    /**
+     * One page of {@code items}, in cursor order, as the EKS list calls answer them: at most 100 a page by default,
+     * a {@code maxResults} outside 1 to 100 or a token of another list refused with InvalidParameterException.
+     */
+    static <T> PaginatedResult<T> page(List<T> items, Function<T, String> cursorOf, Integer maxResults,
+                                       String nextToken, String namespace) {
+        return page(items, cursorOf, maxResults, nextToken, namespace,
+                "maxResults must be between 1 and 100", "Invalid nextToken");
+    }
+
+    /** As above, refusing a bad {@code maxResults} or {@code nextToken} with the operation's own message. */
+    static <T> PaginatedResult<T> page(List<T> items, Function<T, String> cursorOf, Integer maxResults,
+                                       String nextToken, String namespace, String maxResultsMessage,
+                                       String nextTokenMessage) {
         int limit = maxResults == null ? 100 : maxResults;
         if (limit < 1 || limit > 100) {
-            throw invalid("maxResults must be between 1 and 100");
+            throw invalid(maxResultsMessage);
         }
-        return limit;
+        return Pagination.paginate(items, cursorOf, limit, nextToken, namespace, token -> invalid(nextTokenMessage));
     }
 
     private static void requireAccessPolicyArn(Cluster cluster, String policyArn) {
