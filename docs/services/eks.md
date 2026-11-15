@@ -36,6 +36,7 @@ for this error has not been measured; Floci answers as the REST JSON services it
 | `CreateAccessEntry` | Create STANDARD or EC2_LINUX access-entry metadata |
 | `DescribeAccessEntry` | Describe an access entry by IAM principal ARN |
 | `ListAccessEntries` | List principal ARNs with pagination |
+| `ListAccessPolicies` | List the access policies EKS lists, with pagination, each ARN in the caller's partition |
 | `DeleteAccessEntry` | Delete access-entry metadata |
 | `AssociateAccessPolicy` | Associate an EKS access policy and its cluster or namespace scope with a STANDARD access entry |
 | `ListAssociatedAccessPolicies` | List the access policies associated with an access entry, with pagination |
@@ -72,6 +73,8 @@ The access-entry management operations support `STANDARD` (the default) and `EC2
 
 Access policies are management metadata, like the entries they belong to: Floci stores and returns them but does not enforce their Kubernetes permissions. `policyArn` must be an `arn:<partition>:eks::aws:cluster-access-policy/<name>` ARN in the cluster's partition. The policy name itself is not checked against AWS's list of access policies. The scope `type` is `cluster` (no namespaces) or `namespace` (one or more names; wildcards such as `dev-*` are kept as given, and a repeated name is stored once). Associating a policy that is already associated replaces its scope and keeps its `associatedAt`. Only STANDARD entries accept access policies, and deleting an entry removes its policies. Disassociating a policy the entry does not hold succeeds. `ListAccessEntries` accepts `associatedPolicyArn`.
 
+`ListAccessPolicies` answers from `src/main/resources/eks/access-policies.json`, the access policies EKS's own `ListAccessPolicies` lists, in name order. `make eks-access-policies-sync` regenerates it from EKS (it needs AWS credentials); `make aws-data-check` checks its shape without them.
+
 The principal ARN in an access-entry path should be URL-encoded, as the SDKs and the CLI send it. Sent unencoded, a principal whose ARN ends in `/access-policies` (a role named `access-policies`) is read as the access-policies route of the shorter principal before it. A DELETE is a disassociate only when a cluster access policy ARN follows `access-policies`, so an entry with `access-policies` inside its IAM path can always be deleted.
 
 Access entries use EKS storage and retain the IAM principal's stable ID internally. Cluster deletion removes its entries, and a cluster recreated with the same name does not inherit previous entries or pagination tokens.
@@ -93,7 +96,7 @@ rejects instance credentials. Obtain fresh IMDS credentials after upgrading so t
 includes the stable role ID.
 
 !!! note "Authentication scope"
-    Non-worker IAM users and ordinary STS sessions retain the existing cluster-admin compatibility behavior. STANDARD entries, access policies, aws-auth ConfigMap, the cluster-creator bootstrap flag and automatic managed-node entries are not enforced by this change. Updating authentication mode, UpdateAccessEntry, ListAccessPolicies, and entry tag updates remain unimplemented. Native AL2023 images, bootstrap RBAC/CSR approval, CNI and worker networking are separate requirements for registration and Ready.
+    Non-worker IAM users and ordinary STS sessions retain the existing cluster-admin compatibility behavior. STANDARD entries, access policies, aws-auth ConfigMap, the cluster-creator bootstrap flag and automatic managed-node entries are not enforced by this change. Updating authentication mode, UpdateAccessEntry and entry tag updates remain unimplemented. Native AL2023 images, bootstrap RBAC/CSR approval, CNI and worker networking are separate requirements for registration and Ready.
 
 ```bash
 aws --endpoint-url http://localhost:4566 eks create-cluster \

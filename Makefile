@@ -89,7 +89,7 @@ PREFIX ?= $(HOME)/.local
 .PHONY: help dev build test native native-host run-native native-install native-image native-up native-down native-logs clean-sidecars clean-volumes compat docker-tests \
         docs-sync docs-check docs-test partition-check partition-baseline partition-audit partition-test rename-test \
         slr-check slr-table slr-audit slr-test snapshot-mine snapshot-mine-test \
-        aws-data-sync aws-data-sync-botocore aws-data-check aws-data-check-botocore aws-data-test botocore-bump eks-addons-sync \
+        aws-data-sync aws-data-sync-botocore aws-data-check aws-data-check-botocore aws-data-test botocore-bump eks-addons-sync eks-access-policies-sync \
         iam-namespaces-sync iam-namespaces-check iam-namespaces-verify iam-namespaces-test \
         iam-action-resources-sync iam-action-resources-check iam-action-resources-verify \
         iam-action-resources-test iam-authorized-actions-sync iam-authorized-actions-check \
@@ -348,6 +348,12 @@ aws-data-check: aws-data-check-botocore ## CI gate: the vendored AWS data must m
 		echo "       Run 'make eks-addons-sync' and commit the result."; \
 		exit 1; \
 	}
+	@$(PYTHON) tools/aws/regen_eks_access_policies.py --check || { \
+		echo ""; \
+		echo "error: src/main/resources/eks/access-policies.json is malformed."; \
+		echo "       Run 'make eks-access-policies-sync' and commit the result."; \
+		exit 1; \
+	}
 
 aws-data-check-botocore: ## The AWS data derived from botocore must match a fresh generation
 	@$(PYTHON) tools/aws/regen_partitions.py --check --carry-region-flags || { \
@@ -515,6 +521,9 @@ aws-data-check-botocore: ## The AWS data derived from botocore must match a fres
 
 eks-addons-sync: ## Regenerate src/main/resources/eks/addon-versions.json from EKS (needs AWS credentials; commit the result)
 	$(PYTHON) tools/aws/regen_eks_addon_versions.py
+
+eks-access-policies-sync: ## Regenerate src/main/resources/eks/access-policies.json from EKS (needs AWS credentials; commit the result)
+	$(PYTHON) tools/aws/regen_eks_access_policies.py
 
 aws-data-test: ## Run the AWS data generators' unit tests
 	$(PYTHON) -m pytest tools/aws -q

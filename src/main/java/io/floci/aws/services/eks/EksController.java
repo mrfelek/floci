@@ -64,16 +64,18 @@ public class EksController {
     private final EksPodIdentityAssociationService podIdentityAssociations;
     private final EksAddonService addons;
     private final ObjectMapper objectMapper;
+    private final EksAccessPolicyCatalog accessPolicies;
 
     @Inject
     public EksController(EksService eksService, EksAccessEntryService accessEntries,
                          EksPodIdentityAssociationService podIdentityAssociations,
-                         EksAddonService addons, ObjectMapper objectMapper) {
+                         EksAddonService addons, ObjectMapper objectMapper, EksAccessPolicyCatalog accessPolicies) {
         this.eksService = eksService;
         this.accessEntries = accessEntries;
         this.podIdentityAssociations = podIdentityAssociations;
         this.addons = addons;
         this.objectMapper = objectMapper;
+        this.accessPolicies = accessPolicies;
     }
 
     /**
@@ -218,6 +220,15 @@ public class EksController {
     // so S3's path-style catch-all (@Path("/{bucket}/{key: .+}")) cannot swallow them
     // (issue #1754, same family as #1137): validate the cluster, then return the documented
     // empty list under each operation's model-exact result key.
+
+    @GET
+    @Path("/access-policies")
+    public Response listAccessPolicies(@QueryParam("maxResults") String maxResults,
+                                       @QueryParam("nextToken") String nextToken) {
+        PaginatedResult<EksAccessPolicyCatalog.AccessPolicy> page = accessPolicies.list(
+                Pagination.parseMaxResults(maxResults, "InvalidParameterException"), nextToken);
+        return listResponse("accessPolicies", page.items(), page.nextToken());
+    }
 
     @POST
     @Path("/clusters/{name}/access-entries")

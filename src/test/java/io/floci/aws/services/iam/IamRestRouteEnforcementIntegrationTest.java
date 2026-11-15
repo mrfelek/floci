@@ -324,6 +324,26 @@ class IamRestRouteEnforcementIntegrationTest {
     }
 
     @Test
+    void listingEksAccessPoliciesIsCheckedAsItsOwnAction() {
+        // The access policies belong to no cluster, so ListAccessPolicies is granted on "*" and nothing narrower.
+        String user = user("route-eks-access-policies");
+
+        policy(user, allow("eks:ListAccessEntries", "*"));
+        refused(as(user, "eks").get("/access-policies").then(), "eks:ListAccessPolicies");
+
+        policy(user, allow("eks:ListAccessPolicies", "arn:aws:eks:us-east-1:" + ACCOUNT + ":cluster/*"));
+        refused(as(user, "eks").get("/access-policies").then(), "eks:ListAccessPolicies");
+
+        policy(user, allow("eks:ListAccessPolicies", "*"));
+        as(user, "eks").get("/access-policies").then().statusCode(200)
+                .body("accessPolicies.find { it.name == 'AmazonEKSClusterAdminPolicy' }.arn",
+                        equalTo("arn:aws:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy"));
+
+        policy(user, allow("eks:ListAccessEntries", "*"));
+        refused(as(user, "eks").get("/access-policies").then(), "eks:ListAccessPolicies");
+    }
+
+    @Test
     void eksTaggingIsCheckedAgainstTheCallersClusterOfThatName() {
         // EKS tags the caller's own cluster named after the ARN's last /, whatever account the ARN names, so a
         // grant on another account's cluster of that name does not cover it, and one on the caller's own does.

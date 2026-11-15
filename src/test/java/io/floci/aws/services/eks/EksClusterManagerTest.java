@@ -5143,7 +5143,8 @@ class EksClusterManagerTest {
                     Mockito.mock(EksAccessEntryService.class),
                     Mockito.mock(EksPodIdentityAssociationService.class),
                     Mockito.mock(EksAddonService.class),
-                    mapper);
+                    mapper,
+                    Mockito.mock(EksAccessPolicyCatalog.class));
 
             for (Response response : List.of(
                     controller.createCluster(mapper.createObjectNode()),
