@@ -117,6 +117,7 @@ import java.util.concurrent.TimeoutException;
 import java.util.function.BiFunction;
 import java.util.function.BooleanSupplier;
 import java.util.function.Consumer;
+import java.util.function.Supplier;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
@@ -183,6 +184,13 @@ public class EksClusterManager
     static final String BLOCK_STORAGE_MANIFEST_REMOVED = """
             # EKS Auto Mode block storage is off for this cluster.
             # k3s deletes the provisioner an earlier version of this file created.
+            """;
+    static final String LOAD_BALANCING_MANIFEST_FILE = "floci-eks-auto-mode-load-balancing.yaml";
+    static final String LOAD_BALANCING_MANIFEST_TAR_ENTRY = "server/manifests/" + LOAD_BALANCING_MANIFEST_FILE;
+    // The manifest once load balancing is off: no objects, so k3s deletes the IngressClassParams kind it held before.
+    static final String LOAD_BALANCING_MANIFEST_REMOVED = """
+            # EKS Auto Mode load balancing is off for this cluster.
+            # k3s deletes the IngressClassParams kind an earlier version of this file created.
             """;
     private static final String ENDPOINT_MODE_NETWORK = "network";
     public static final String DEFAULT_POD_CIDR = "10.42.0.0/16";
@@ -1025,6 +1033,7 @@ public class EksClusterManager
         linkContainerdCertsDir(containerId, cluster.getName());
         registerPodIdentityWebhook(containerId, cluster);
         applyBlockStorage(containerId, cluster);
+        applyLoadBalancing(containerId, cluster);
         if (signingKeyFiles != null) {
             copySigningKeysIntoContainer(containerId, signingKeyFiles, cluster.getName());
         }
@@ -1187,6 +1196,7 @@ public class EksClusterManager
         registerPodIdentityWebhook(info.containerId(), cluster,
                 () -> survivingNodeResolvesThroughFloci(info.containerId()));
         applyBlockStorage(info.containerId(), cluster);
+        applyLoadBalancing(info.containerId(), cluster);
         activeClusters.put(clusterResourceName(cluster), cluster);
         attachClusterLogs(cluster, true, true, false);
 
@@ -3080,19 +3090,55 @@ public class EksClusterManager
      * the manifest lives on the cluster's data volume, which outlives a restart, and k3s prunes what it created.
      */
     void applyBlockStorage(String containerId, Cluster cluster) {
-        boolean enabled = StorageConfig.blockStorageOn(cluster.getStorageConfig());
+        applyAutoModeManifest(containerId, cluster, StorageConfig.blockStorageOn(cluster.getStorageConfig()),
+                BLOCK_STORAGE_MANIFEST_FILE, BLOCK_STORAGE_MANIFEST_TAR_ENTRY, this::blockStorageManifest,
+                BLOCK_STORAGE_MANIFEST_REMOVED, "block storage provisioner");
+    }
+
+    /**
+     * Installs the {@code IngressClassParams} kind while the cluster's EKS Auto Mode load balancing is on, as Auto
+     * Mode does, so the IngressClass an Application Load Balancer is configured through can name its parameters;
+     * otherwise removes it, as {@link #applyBlockStorage} removes the provisioner.
+     */
+    void applyLoadBalancing(String containerId, Cluster cluster) {
+        boolean enabled = cluster.getKubernetesNetworkConfig() != null
+                && ElasticLoadBalancing.loadBalancingOn(cluster.getKubernetesNetworkConfig().getElasticLoadBalancing());
+        applyAutoModeManifest(containerId, cluster, enabled, LOAD_BALANCING_MANIFEST_FILE,
+                LOAD_BALANCING_MANIFEST_TAR_ENTRY, this::loadBalancingManifest, LOAD_BALANCING_MANIFEST_REMOVED,
+                "IngressClassParams kind");
+    }
+
+    /**
+     * Installs an EKS Auto Mode capability's manifest while it is {@code enabled}, or, if it was installed before,
+     * replaces it with {@code removed}, which holds no objects: the manifest lives on the cluster's data volume,
+     * which outlives a restart, and k3s prunes what it created.
+     */
+    private void applyAutoModeManifest(String containerId, Cluster cluster, boolean enabled, String fileName,
+                                       String tarEntry, Supplier<String> manifest, String removed, String what) {
         try {
-            if (!enabled && !Files.exists(localClusterFile(cluster, "auto-mode", BLOCK_STORAGE_MANIFEST_FILE))) {
+            if (!enabled && !Files.exists(localClusterFile(cluster, "auto-mode", fileName))) {
                 return;
             }
-            installManifest(containerId, cluster, "auto-mode", BLOCK_STORAGE_MANIFEST_FILE,
-                    BLOCK_STORAGE_MANIFEST_TAR_ENTRY, enabled ? blockStorageManifest() : BLOCK_STORAGE_MANIFEST_REMOVED);
+            installManifest(containerId, cluster, "auto-mode", fileName, tarEntry, enabled ? manifest.get() : removed);
             if (enabled) {
-                LOG.infov("Installed the EKS Auto Mode block storage provisioner for cluster {0}", cluster.getName());
+                LOG.infov("Installed the EKS Auto Mode {0} for cluster {1}", what, cluster.getName());
             }
         } catch (Exception e) {
-            LOG.warnv("EKS cluster {0} gets no Auto Mode block storage: could not install {1} into the k3s "
-                    + "container: {2}", cluster.getName(), BLOCK_STORAGE_MANIFEST_FILE, e.getMessage());
+            LOG.warnv("EKS cluster {0} gets no Auto Mode {1}: could not install {2} into the k3s container: {3}",
+                    cluster.getName(), what, fileName, e.getMessage());
+        }
+    }
+
+    /** The IngressClassParams kind EKS Auto Mode load balancing installs. */
+    String loadBalancingManifest() {
+        // An inline literal, which the native image build finds and packages.
+        try (InputStream in = EksClusterManager.class.getResourceAsStream("/eks/auto-mode-load-balancing.yaml")) {
+            if (in == null) {
+                throw new IllegalStateException("missing resource /eks/auto-mode-load-balancing.yaml");
+            }
+            return new String(in.readAllBytes(), StandardCharsets.UTF_8);
+        } catch (IOException e) {
+            throw new UncheckedIOException(e);
         }
     }
 
