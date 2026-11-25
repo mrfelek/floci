@@ -1205,12 +1205,9 @@ public class KinesisService implements ResourceProvider {
             // deleted before we get here is absent and this fails like any other missing stream rather
             // than appending to a stale instance and resurrecting it.
             KinesisStream current = resolveStreamForAccountMigrating(accountId, streamName, region);
-            requireWritableStream(current);
-            // A missing or not-yet-active stream reports ResourceNotFoundException ahead of an
-            // invalid ExplicitHashKey. Size validation runs against the same lock-protected instance
-            // that shard selection and the append use.
-            validateExplicitHashKey(explicitHashKey);
-            validateRecordSize(current, data, partitionKey);
+            // Size validation runs against the same lock-protected instance that shard selection and the
+            // append use.
+            validatePut(current, data, partitionKey, explicitHashKey);
             KinesisShard shard = selectShard(current, partitionKey, explicitHashKey);
             pruneExpiredRecords(current, shard);
             String sequenceNumber = String.valueOf(sequenceGenerator.incrementAndGet());
@@ -1222,13 +1219,18 @@ public class KinesisService implements ResourceProvider {
         }
     }
 
-    /**
-     * The checks PutRecord makes before it appends, for a dry run: the stream exists and takes writes, and the
-     * explicit hash key and the record's size are valid.
-     */
+    /** The checks PutRecord makes before it appends, for a dry run, on the stream it names. */
     public void checkPutRecord(String streamName, byte[] data, String partitionKey, String explicitHashKey,
                                String region) {
-        KinesisStream stream = resolveStream(streamName, region);
+        validatePut(resolveStream(streamName, region), data, partitionKey, explicitHashKey);
+    }
+
+    /**
+     * The checks a put makes on {@code stream} before it appends, the real one and a dry run alike: the stream takes
+     * writes, then the explicit hash key and the record's size are valid. A missing or not-yet-active stream reports
+     * ResourceNotFoundException ahead of an invalid ExplicitHashKey.
+     */
+    private void validatePut(KinesisStream stream, byte[] data, String partitionKey, String explicitHashKey) {
         requireWritableStream(stream);
         validateExplicitHashKey(explicitHashKey);
         validateRecordSize(stream, data, partitionKey);
