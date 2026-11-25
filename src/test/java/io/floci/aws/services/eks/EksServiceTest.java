@@ -457,6 +457,8 @@ class EksServiceTest {
                 new ComputeConfig(false, List.of(), null), new StorageConfig(new BlockStorage(false)), off));
 
         verify(clusterManager, times(2)).replaceNodeForServiceLb(running);
+        // Each Auto Mode update gives the running node the pools it names, or none once compute is off.
+        verify(clusterManager, times(3)).applyCompute(eq("k3s-auto-running"), eq(running));
     }
 
     @Test
